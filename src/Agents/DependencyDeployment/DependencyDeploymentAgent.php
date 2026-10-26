@@ -11,6 +11,7 @@ use Workspace\Agents\Kernel\Finding;
 use Workspace\Agents\Kernel\ProtocolException;
 use Workspace\Agents\Kernel\Result;
 use Workspace\Agents\Kernel\Task;
+use Workspace\Agents\Support\Paths;
 
 /**
  * Dependency & Deployment Agent.
@@ -194,14 +195,28 @@ final class DependencyDeploymentAgent extends AbstractAgent
         }
         foreach ($consumers as $consumer => $providers) {
             $policy = $snapshots[$consumer]->policy ?? null;
-            if ($policy !== null && empty($policy['git_dependencies'])) {
+            if ($policy === null) {
+                continue;
+            }
+            // A declared dependency covers a provider when its path, resolved
+            // the way ReleasePreparer does ({project_root} = consumer root),
+            // is that provider's checkout.
+            foreach ($policy['git_dependencies'] ?? [] as $dependency) {
+                $resolved = Paths::normalize(str_replace('{project_root}', $snapshots[$consumer]->root, (string) ($dependency['path'] ?? '')));
+                foreach (array_keys($providers) as $provider) {
+                    if (Paths::relative($snapshots[$provider]->root, $resolved) === '') {
+                        unset($providers[$provider]);
+                    }
+                }
+            }
+            if ($providers !== []) {
                 $findings[] = Finding::info(
                     'RECOMMEND_GIT_DEPENDENCY',
-                    "{$consumer} installs packages from ".implode(', ', array_keys($providers))." but its release-policy declares no git_dependencies, so its release metadata cannot record which provider commit it was validated against.",
+                    "{$consumer} installs packages from ".implode(', ', array_keys($providers))." but no git_dependencies entry in its release-policy resolves to that checkout, so its release metadata cannot record which provider commit it was validated against.",
                     $consumer,
                     ['suggested_git_dependencies' => array_map(static fn (string $provider): array => [
                         'name' => $provider,
-                        'path' => '<clean release worktree of '.$provider.'>',
+                        'path' => '{project_root}/../'.basename($snapshots[$provider]->root),
                         'branch' => $snapshots[$provider]->policy['production_branch'] ?? 'main',
                     ], array_keys($providers))],
                     'Owner decision: add git_dependencies to the consumer release-policy.json.',

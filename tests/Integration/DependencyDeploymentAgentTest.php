@@ -280,6 +280,46 @@ final class DependencyDeploymentAgentTest extends TestCase
         $this->assertThrows(RuntimeException::class, fn () => (new \DeploymentContract\ReleasePreparer($this->fixture->path(self::P)))->run(false), 'MIXED WORKTREE');
     }
 
+    /**
+     * Pins the owner-approved customer-site git_dependencies entry (read from
+     * the real policy file) to its effect in the real ReleasePreparer: the
+     * provider HEAD is recorded, and a dirty or off-branch provider blocks.
+     */
+    public function testCustomerSiteGitDependencyPinsTheProviderCommit(): void
+    {
+        $library = dirname(__DIR__, 3).'/deployment-system/deployment/lib/ReleasePreparer.php';
+        $realPolicy = dirname(__DIR__, 3).'/customer-site/.deployment/release-policy.json';
+        if (! is_file($library) || ! is_file($realPolicy)) {
+            $this->skip('deployment-system or customer-site is not checked out beside agents/');
+        }
+        require_once $library;
+        $entry = Json::decodeFile($realPolicy)['git_dependencies'] ?? [];
+        $this->assertSame([['name' => 'saas-platform', 'path' => '{project_root}/../saas-platform', 'branch' => 'main']], $entry);
+
+        $this->assertContains('RECOMMEND_GIT_DEPENDENCY', $this->codes($this->run()));
+        $policy = Json::decodeFile($this->fixture->path(self::C, '.deployment/release-policy.json'));
+        $policy['git_dependencies'] = $entry;
+        $this->fixture->write(self::C, '.deployment/release-policy.json', Json::encode($policy));
+        $this->fixture->commitAll(self::C, 'pin saas-platform');
+
+        $this->fixture->write(self::C, 'src/App.php', "<?php\n\nreturn 'pinned';\n");
+        $outcome = $this->run(['projects' => [self::C], 'task_id' => 'WU-9']);
+        $this->assertNotContains('RECOMMEND_GIT_DEPENDENCY', $this->codes($outcome));
+        $this->fixture->write(self::C, '.deployment/release-task.json', Json::encode($this->draft($outcome, self::C)));
+        $prepare = fn (): array => (new \DeploymentContract\ReleasePreparer($this->fixture->path(self::C)))->run(false);
+
+        $summary = $prepare();
+        $this->assertSame('READY', $summary['status']);
+        $this->assertSame(['saas-platform' => $this->fixture->git(self::P, 'rev-parse', 'HEAD')], $summary['dependency_commits']);
+
+        $this->fixture->write(self::P, 'scratch.txt', 'uncommitted');
+        $this->assertThrows(RuntimeException::class, $prepare, 'DIRTY DEPENDENCY WORKTREE');
+        unlink($this->fixture->path(self::P, 'scratch.txt'));
+
+        $this->fixture->git(self::P, 'checkout', '-q', '-b', 'feature');
+        $this->assertThrows(RuntimeException::class, $prepare, 'DEPENDENCY BRANCH MISMATCH');
+    }
+
     public function testCliRunsTheAgentAndHonoursStrictMode(): void
     {
         $agent = dirname(__DIR__, 2).'/bin/agent';
