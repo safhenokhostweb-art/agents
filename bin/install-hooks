@@ -1,0 +1,69 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+// Installs the pre-push readiness gate into every project in workspace.json.
+// The hook is a thin shim that executes bin/pre-push-gate from this
+// repository, so gate logic stays versioned here. A foreign pre-push hook is
+// never overwritten without --force. Re-running is idempotent.
+//
+//   php agents/bin/install-hooks [--workspace=<file>] [--force]
+
+require dirname(__DIR__).'/bootstrap.php';
+
+use Workspace\Agents\Kernel\AgentContext;
+use Workspace\Agents\Support\Paths;
+use Workspace\Agents\Support\Process;
+
+const MARKER = 'workspace-agents pre-push gate';
+
+$options = [];
+foreach (array_slice($argv, 1) as $argument) {
+    [$key, $value] = array_pad(explode('=', ltrim($argument, '-'), 2), 2, true);
+    $options[$key] = $value;
+}
+$workspaceFile = Paths::normalize((string) ($options['workspace'] ?? dirname(__DIR__).'/workspace.json'));
+$gate = Paths::normalize(__DIR__.'/pre-push-gate');
+$php = str_replace('\\', '/', PHP_BINARY);
+foreach ([$workspaceFile, $gate, $php] as $path) {
+    if (strpbrk($path, "\"`\$\\\n") !== false) {
+        fwrite(STDERR, "Refusing to embed unsafe path in a shell hook: {$path}\n");
+        exit(1);
+    }
+}
+
+$marker = MARKER;
+$shim = <<<SH
+#!/bin/sh
+# {$marker} — installed by agents/bin/install-hooks; see agents/README.md.
+# Override the interpreter with AGENTS_PHP; AGENTS_GATE_STRICT=1 also refuses warnings.
+exec "\${AGENTS_PHP:-{$php}}" "{$gate}" --workspace="{$workspaceFile}" "\$@"
+
+SH;
+
+$context = AgentContext::fromFile($workspaceFile);
+$failed = false;
+foreach (array_keys($context->projects()) as $name) {
+    $root = $context->projectPath($name);
+    $hooks = Process::run(['git', 'rev-parse', '--git-path', 'hooks'], $root);
+    if ($hooks['code'] !== 0) {
+        echo "skip {$name}: not a git repository ({$root})\n";
+        $failed = true;
+        continue;
+    }
+    $directory = Paths::join($root, trim($hooks['stdout']));
+    $hook = $directory.'/pre-push';
+    if (is_file($hook) && ! str_contains((string) file_get_contents($hook), MARKER) && ! isset($options['force'])) {
+        echo "skip {$name}: a foreign pre-push hook exists at {$hook} (re-run with --force to replace it)\n";
+        $failed = true;
+        continue;
+    }
+    if (! is_dir($directory)) {
+        mkdir($directory, 0775, true);
+    }
+    file_put_contents($hook, $shim);
+    chmod($hook, 0755);
+    echo "installed {$name}: {$hook}\n";
+}
+exit($failed ? 1 : 0);

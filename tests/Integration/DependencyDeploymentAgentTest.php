@@ -187,6 +187,43 @@ final class DependencyDeploymentAgentTest extends TestCase
         $this->assertSame(['changed' => 4, 'candidate' => 2, 'excluded_runtime' => 1, 'outside_policy' => 1], $record);
     }
 
+    /**
+     * The agent and the real ReleasePreparer must agree on content-bound
+     * migration reviews: reviewed bytes pass both, an edit blocks both.
+     */
+    public function testMigrationReviewsAgreeWithTheRealReleasePreparer(): void
+    {
+        $library = dirname(__DIR__, 3).'/deployment-system/deployment/lib/ReleasePreparer.php';
+        if (! is_file($library)) {
+            $this->skip('deployment-system is not checked out beside agents/');
+        }
+        require_once $library;
+        if (! method_exists('DeploymentContract\\ReleasePreparer', 'migrationDigest')) {
+            $this->skip('the checked-out deployment-system has no migration review support');
+        }
+        $path = 'database/migrations/2026_01_02_000000_create_things.php';
+        $source = "<?php\nSchema::create('things', fn () => null);\nSchema::drop('things');\n";
+        $policy = Json::decodeFile($this->fixture->path(self::C, '.deployment/release-policy.json'));
+        $policy['migration_policy']['reviewed'] = [[
+            'path' => $path,
+            'sha256' => \DeploymentContract\ReleasePreparer::migrationDigest($source),
+            'reviewed_by' => 'owner', 'reviewed_at' => '2026-10-26', 'reason' => 'drops only its own table',
+        ]];
+        $this->fixture->write(self::C, '.deployment/release-policy.json', Json::encode($policy));
+        $this->fixture->commitAll(self::C, 'record review');
+
+        $this->fixture->write(self::C, $path, str_replace("\n", "\r\n", $source));
+        $outcome = $this->run(['projects' => [self::C]]);
+        $this->assertNotContains('MIGRATION_REVIEW_REQUIRED', $this->codes($outcome));
+        $this->fixture->write(self::C, '.deployment/release-task.json', Json::encode($this->draft($outcome, self::C)));
+        $this->assertSame('READY', (new \DeploymentContract\ReleasePreparer($this->fixture->path(self::C)))->run(false)['status']);
+
+        $this->fixture->write(self::C, $path, $source."Schema::drop('users');\n");
+        $edited = $this->run(['projects' => [self::C]]);
+        $this->assertStringContains('changed since its recorded review', $this->finding($edited, 'MIGRATION_REVIEW_REQUIRED')->message);
+        $this->assertThrows(RuntimeException::class, fn () => (new \DeploymentContract\ReleasePreparer($this->fixture->path(self::C)))->run(false), 'MIGRATION REVIEW REQUIRED');
+    }
+
     public function testBranchDeltaIsMeasuredFromTheMergeBaseNotProductionHead(): void
     {
         $this->fixture->git(self::C, 'checkout', '-q', '-b', 'feature');
@@ -318,6 +355,50 @@ final class DependencyDeploymentAgentTest extends TestCase
 
         $this->fixture->git(self::P, 'checkout', '-q', '-b', 'feature');
         $this->assertThrows(RuntimeException::class, $prepare, 'DEPENDENCY BRANCH MISMATCH');
+    }
+
+    /**
+     * End to end through real `git push`: the installed hook lets a clean push
+     * through, refuses a push while a blocker exists (remote unchanged),
+     * skips linked worktrees, and never overwrites a foreign hook.
+     */
+    public function testPrePushGateBlocksOnlyOnBlockersAndSkipsLinkedWorktrees(): void
+    {
+        $install = fn (string ...$extra) => Process::run(array_merge([PHP_BINARY, dirname(__DIR__, 2).'/bin/install-hooks', '--workspace='.$this->fixture->root.'/workspace.json'], $extra), $this->fixture->root);
+        $foreign = $this->fixture->path(self::P, '.git/hooks/pre-push');
+        file_put_contents($foreign, "#!/bin/sh\nexit 0\n");
+        $first = $install();
+        $this->assertSame(1, $first['code'], $first['stdout']);
+        $this->assertSame("#!/bin/sh\nexit 0\n", file_get_contents($foreign), 'a foreign hook must not be overwritten');
+        $this->assertStringContains('workspace-agents pre-push gate', (string) file_get_contents($this->fixture->path(self::C, '.git/hooks/pre-push')));
+        $this->assertSame(0, $install('--force')['code']);
+        $this->assertSame(0, $install()['code'], 're-running over our own hook is idempotent');
+
+        $push = fn (string $project) => Process::run(['git', 'push', 'origin', 'HEAD:main'], $this->fixture->path($project));
+        $remoteHead = fn () => $this->fixture->git(self::C, 'ls-remote', 'origin', 'refs/heads/main');
+
+        $this->fixture->write(self::C, 'src/App.php', "<?php\n\nreturn 'gated';\n");
+        $this->fixture->commitAll(self::C, 'clean change', push: false);
+        $clean = $push(self::C);
+        $this->assertSame(0, $clean['code'], $clean['stderr']);
+        $this->assertStringContains('agents gate: customer-site: READY', $clean['stderr']);
+
+        $manifest = Json::decodeFile($this->fixture->path(self::C, 'composer.json'));
+        $manifest['require']['monolog/monolog'] = '^3.0';
+        $this->fixture->write(self::C, 'composer.json', Json::encode($manifest));
+        $this->fixture->commitAll(self::C, 'manifest without lock', push: false);
+        $before = $remoteHead();
+        $refused = $push(self::C);
+        $this->assertFalse($refused['code'] === 0, 'push must be refused');
+        $this->assertStringContains('BLOCKER LOCK_OUT_OF_SYNC', $refused['stderr']);
+        $this->assertStringContains('push refused', $refused['stderr']);
+        $this->assertSame($before, $remoteHead(), 'the remote must not move when the gate refuses');
+
+        $worktree = $this->fixture->root.'/wt-release';
+        $this->fixture->git(self::C, 'worktree', 'add', '-q', '-b', 'release-wt', $worktree, 'origin/main');
+        $skipped = Process::run(['git', 'push', 'origin', 'HEAD:refs/heads/release-wt'], $worktree);
+        $this->assertSame(0, $skipped['code'], $skipped['stderr']);
+        $this->assertStringContains('not a workspace project checkout', $skipped['stderr']);
     }
 
     public function testCliRunsTheAgentAndHonoursStrictMode(): void

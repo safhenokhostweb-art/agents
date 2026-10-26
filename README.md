@@ -37,6 +37,22 @@ php agents/tests/run.php [filter]
 findings) and `--strict`. Exit codes: `0` PASS, `1` FAILED or runtime error,
 `2` BLOCKED, `3` PASS but a verdict other than `READY` (`--strict` only).
 
+### Pre-push gate
+
+`php agents/bin/install-hooks` installs a `pre-push` shim into each project
+in `workspace.json` (a foreign hook is never replaced without `--force`). On
+every push from a project's primary checkout it runs `deployment.readiness`
+scoped to that project via `bin/pre-push-gate` and:
+
+- refuses the push on a `BLOCKED` verdict or if readiness cannot be evaluated;
+- prints warnings without refusing. `CROSS_REPO_COUPLING` and stray-path
+  warnings are normal on feature branches, so refusing them would block all
+  work. Set `AGENTS_GATE_STRICT=1` to refuse any non-`READY` verdict;
+- skips linked worktrees (release-prepare and scratch worktrees push from
+  those, and their state is not the workspace's).
+
+Bypassing it with `git push --no-verify` is an owner decision.
+
 On this machine PHP is not on the Git-Bash PATH; use
 `C:/laragon/bin/php/php-8.4.16-nts-Win32-vs17-x64/php.exe`.
 
@@ -185,7 +201,7 @@ drafts. Scoping never hides cross-project coupling.
 | `UNRESOLVABLE_SHARED_DEPENDENCY` | blocker | a provider package is required with no path repository able to install it |
 | `PATH_REPOSITORY_MISSING` | blocker | a `path` repository points at a directory that does not exist |
 | `PACKAGE_BOUNDARY` | blocker | a policy `dependency_rules` pair is split across releases |
-| `MIGRATION_REVIEW_REQUIRED` | blocker | a changed migration matches a policy review pattern (release-prepare fails closed) |
+| `MIGRATION_REVIEW_REQUIRED` | blocker | a changed migration matches a policy review pattern and has no matching content-bound owner review in `migration_policy.reviewed` (release-prepare fails closed) |
 | `RELEASE_POLICY_INVALID` | blocker | the release policy lacks fields release-prepare requires |
 | `MIRROR_DRIFT` | warning | a consumer's `symlink:false` vendor copy differs byte-wise from the package source |
 | `SHARED_PACKAGE_UNCOMMITTED` | warning | the provider's package source has uncommitted changes |

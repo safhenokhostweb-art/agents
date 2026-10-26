@@ -167,9 +167,21 @@ final class ReleaseReadinessAnalyzer
         return ['record' => $record, 'draft' => $draft, 'findings' => $findings];
     }
 
-    /** @return array<string, string> path => reason, mirroring ReleasePreparer::checkMigrations() */
+    /**
+     * Mirrors ReleasePreparer::checkMigrations(), including content-bound
+     * owner reviews (migration_policy.reviewed): a review clears exactly the
+     * reviewed bytes, sha256 over LF-normalized content.
+     *
+     * @return array<string, string> path => reason
+     */
     private function migrationIssues(string $root, array $candidate, array $migrationPolicy): array
     {
+        $reviews = [];
+        foreach ($migrationPolicy['reviewed'] ?? [] as $review) {
+            if (is_array($review) && is_string($review['path'] ?? null) && is_string($review['sha256'] ?? null)) {
+                $reviews[$review['path']] = $review['sha256'];
+            }
+        }
         $issues = [];
         foreach ($candidate as $path) {
             if (! Glob::matches($path, $migrationPolicy['paths'] ?? [])) {
@@ -182,7 +194,13 @@ final class ReleaseReadinessAnalyzer
             }
             foreach ($migrationPolicy['review_required_patterns'] ?? [] as $pattern) {
                 if (@preg_match('/'.$pattern.'/i', $content) === 1) {
-                    $issues[$path] = "matches review pattern {$pattern}";
+                    $digest = hash('sha256', str_replace(["\r\n", "\r"], "\n", $content));
+                    if (isset($reviews[$path]) && hash_equals($reviews[$path], $digest)) {
+                        break;
+                    }
+                    $issues[$path] = isset($reviews[$path])
+                        ? "matches review pattern {$pattern} and changed since its recorded review"
+                        : "matches review pattern {$pattern}";
                     break;
                 }
             }

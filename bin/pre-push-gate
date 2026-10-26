@@ -1,0 +1,79 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+// Pre-push readiness gate, invoked by the shim bin/install-hooks writes into
+// each project's .git/hooks/pre-push. Runs deployment.readiness scoped to the
+// project being pushed and refuses the push on a BLOCKED verdict, or on any
+// non-READY verdict when AGENTS_GATE_STRICT=1. Fails closed if readiness
+// cannot be evaluated. Linked worktrees (release-prepare, scratch) are not
+// workspace project checkouts and are skipped.
+
+require dirname(__DIR__).'/bootstrap.php';
+
+use Workspace\Agents\Agents\DependencyDeployment\DependencyDeploymentAgent;
+use Workspace\Agents\Kernel\Runtime;
+use Workspace\Agents\Kernel\Status;
+use Workspace\Agents\Kernel\Task;
+use Workspace\Agents\Support\Paths;
+use Workspace\Agents\Support\Process;
+
+$options = [];
+foreach (array_slice($argv, 1) as $argument) {
+    if (str_starts_with($argument, '--') && str_contains($argument, '=')) {
+        [$key, $value] = explode('=', substr($argument, 2), 2);
+        $options[$key] = $value;
+    }
+}
+$base = dirname(__DIR__);
+$strict = getenv('AGENTS_GATE_STRICT') === '1';
+$say = static function (string $line): void {
+    fwrite(STDERR, "agents gate: {$line}\n");
+};
+
+try {
+    $runtime = Runtime::boot($options['workspace'] ?? $base.'/workspace.json', $options['registry'] ?? $base.'/agents.json');
+    $top = Paths::normalize(trim(Process::run(['git', 'rev-parse', '--show-toplevel'], (string) getcwd())['stdout']));
+    $project = null;
+    foreach (array_keys($runtime->context->projects()) as $name) {
+        if (Paths::relative($runtime->context->projectPath($name), $top) === '') {
+            $project = $name;
+        }
+    }
+    if ($project === null) {
+        $say("{$top} is not a workspace project checkout (release or scratch worktree); skipped.");
+        exit(0);
+    }
+
+    // stdin: "<local ref> <local sha> <remote ref> <remote sha>" per update.
+    $updates = array_values(array_filter(array_map('trim', explode("\n", (string) stream_get_contents(STDIN)))));
+    $deletesOnly = $updates !== [] && array_filter($updates, static fn (string $u): bool => ! preg_match('/^\S+ 0{40} /', $u)) === [];
+    if ($deletesOnly) {
+        $say('branch deletion only; skipped.');
+        exit(0);
+    }
+
+    $outcome = $runtime->orchestrator->dispatch(Task::create(DependencyDeploymentAgent::TASK, ['projects' => [$project]]))[0];
+    $result = $outcome->result;
+    $verdict = $result->data['verdict'] ?? null;
+    $say("{$project}: {$result->summary}");
+    foreach ($result->findings as $finding) {
+        if ($finding->severity->value !== 'info') {
+            $say('  '.strtoupper($finding->severity->value)." {$finding->code}".($finding->subject !== null ? " [{$finding->subject}]" : ''));
+        }
+    }
+    foreach ($outcome->artifacts as $artifact) {
+        $say("  report: {$artifact['path']}");
+    }
+
+    $refused = $result->status !== Status::Pass || $verdict === 'BLOCKED' || ($strict && $verdict !== 'READY');
+    if ($refused) {
+        $say('push refused. Resolve the findings above (details in the report). Bypassing this gate with --no-verify is an owner decision.');
+        exit(1);
+    }
+    exit(0);
+} catch (Throwable $exception) {
+    $say('could not evaluate readiness, push refused: '.$exception->getMessage());
+    exit(1);
+}
