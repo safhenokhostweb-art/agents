@@ -1,0 +1,16 @@
+{
+    "schema": "agents.workspace/v1",
+    "root": "..",
+    "projects": {
+        "saas-platform": { "path": "saas-platform", "role": "provider" },
+        "customer-site": { "path": "customer-site", "role": "consumer" }
+    },
+    "deployment_system": {
+        "path": "deployment-system",
+        "release_prepare": "deployment-system/deployment/release-prepare.php"
+    },
+    "runtime": {
+        "artifacts": "agents/var/artifacts",
+        "journal": "agents/var/bus/journal.jsonl"
+    }
+}

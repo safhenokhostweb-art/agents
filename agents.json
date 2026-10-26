@@ -1,0 +1,13 @@
+{
+    "schema": "agents.registry/v1",
+    "agents": [
+        {
+            "id": "dependency-deployment",
+            "class": "Workspace\\Agents\\Agents\\DependencyDeployment\\DependencyDeploymentAgent",
+            "enabled": true,
+            "subscriptions": [
+                { "topic": "release.requested", "task": "deployment.readiness" }
+            ]
+        }
+    ]
+}

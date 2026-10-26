@@ -1,0 +1,146 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+require dirname(__DIR__).'/bootstrap.php';
+
+use Workspace\Agents\Kernel\ArtifactStore;
+use Workspace\Agents\Kernel\JournaledBus;
+use Workspace\Agents\Kernel\Outcome;
+use Workspace\Agents\Kernel\Runtime;
+use Workspace\Agents\Kernel\Status;
+use Workspace\Agents\Kernel\Task;
+use Workspace\Agents\Support\Json;
+
+const USAGE = <<<'TXT'
+Workspace agent runtime
+
+Usage:
+  php agents/bin/agent list
+  php agents/bin/agent run <task-type> [--payload='{"k":"v"}'] [--target=<agent-id>] [--json] [--strict] [--verbose]
+  php agents/bin/agent dispatch <task.json> [--json] [--strict] [--verbose]
+  php agents/bin/agent verify <artifact.json>
+  php agents/bin/agent journal [--correlation=<id>]
+
+Options:
+  --workspace=<file>  workspace topology (default agents/workspace.json)
+  --registry=<file>   agent registry (default agents/agents.json)
+
+Exit codes: 0 PASS, 1 FAILED or error, 2 BLOCKED, 3 PASS but verdict not READY (--strict only)
+
+TXT;
+
+$options = [];
+$positional = [];
+foreach (array_slice($argv, 1) as $argument) {
+    if (str_starts_with($argument, '--')) {
+        [$key, $value] = array_pad(explode('=', substr($argument, 2), 2), 2, true);
+        $options[$key] = $value;
+    } else {
+        $positional[] = $argument;
+    }
+}
+$base = dirname(__DIR__);
+$workspaceFile = (string) ($options['workspace'] ?? $base.'/workspace.json');
+$registryFile = (string) ($options['registry'] ?? $base.'/agents.json');
+
+try {
+    switch ($positional[0] ?? 'help') {
+        case 'list':
+            $runtime = Runtime::boot($workspaceFile, $registryFile);
+            foreach ($runtime->registry->all() as $agent) {
+                echo "{$agent->id()} v{$agent->version()}\n  handles: ".implode(', ', $agent->handles())."\n";
+            }
+            foreach ($runtime->registry->subscriptions() as $s) {
+                echo "  subscription: {$s['topic']} -> {$s['agent']} ({$s['task']})\n";
+            }
+            exit(0);
+
+        case 'run':
+        case 'dispatch':
+            if (! isset($positional[1])) {
+                throw new InvalidArgumentException('Missing '.($positional[0] === 'run' ? '<task-type>' : '<task.json>').'.');
+            }
+            $task = $positional[0] === 'run'
+                ? Task::create($positional[1], isset($options['payload']) ? Json::decode((string) $options['payload'], '--payload') : [], isset($options['target']) ? (string) $options['target'] : null)
+                : Task::fromArray(Json::decodeFile($positional[1]));
+            $runtime = Runtime::boot($workspaceFile, $registryFile);
+            $outcomes = $runtime->orchestrator->dispatch($task);
+            if (isset($options['json'])) {
+                echo Json::encode(array_map(static fn (Outcome $o): array => $o->toArray(), $outcomes)), "\n";
+            } else {
+                foreach ($outcomes as $outcome) {
+                    printOutcome($outcome, isset($options['verbose']));
+                }
+                echo "correlation: {$task->correlationId}\njournal:     {$runtime->journalPath}\n";
+            }
+            exit(exitCode($outcomes, isset($options['strict'])));
+
+        case 'verify':
+            $check = ArtifactStore::verify((string) ($positional[1] ?? ''));
+            echo $check['valid'] ? "VALID\n" : "INVALID\n  ".implode("\n  ", $check['errors'])."\n";
+            exit($check['valid'] ? 0 : 1);
+
+        case 'journal':
+            $runtime = Runtime::boot($workspaceFile, $registryFile);
+            foreach (JournaledBus::read($runtime->journalPath, isset($options['correlation']) ? (string) $options['correlation'] : null) as $message) {
+                echo "{$message->occurredAt}  {$message->topic}  <{$message->source}>  hop={$message->hop}  corr={$message->correlationId}\n";
+            }
+            exit(0);
+
+        default:
+            echo USAGE;
+            exit(isset($positional[0]) && $positional[0] !== 'help' ? 1 : 0);
+    }
+} catch (Throwable $exception) {
+    fwrite(STDERR, 'error: '.$exception->getMessage().PHP_EOL);
+    exit(1);
+}
+
+function printOutcome(Outcome $outcome, bool $verbose): void
+{
+    $result = $outcome->result;
+    echo "[{$result->status->value}] ".($outcome->agentId ?? '-')." {$outcome->task->type} ({$outcome->durationMs} ms)\n  {$result->summary}\n";
+    if ($result->error !== null) {
+        echo "  error: {$result->error}\n";
+    }
+    $info = 0;
+    foreach ($result->findings as $finding) {
+        if ($finding->severity->value === 'info' && ! $verbose) {
+            $info++;
+            continue;
+        }
+        echo '  - '.strtoupper($finding->severity->value)." {$finding->code}".($finding->subject !== null ? " [{$finding->subject}]" : '')."\n    {$finding->message}\n";
+        if ($finding->remedy !== null) {
+            echo "    remedy: {$finding->remedy}\n";
+        }
+    }
+    if ($info > 0) {
+        echo "  ({$info} info finding(s) hidden; use --verbose)\n";
+    }
+    foreach ($outcome->artifacts as $artifact) {
+        echo "  artifact: {$artifact['path']}\n  digest:   {$artifact['digest']}\n";
+    }
+}
+
+/** @param list<Outcome> $outcomes */
+function exitCode(array $outcomes, bool $strict): int
+{
+    $statuses = array_map(static fn (Outcome $o): Status => $o->result->status, $outcomes);
+    if (in_array(Status::Failed, $statuses, true)) {
+        return 1;
+    }
+    if (in_array(Status::Blocked, $statuses, true)) {
+        return 2;
+    }
+    if ($strict) {
+        foreach ($outcomes as $outcome) {
+            if (($outcome->result->data['verdict'] ?? 'READY') !== 'READY') {
+                return 3;
+            }
+        }
+    }
+
+    return 0;
+}
