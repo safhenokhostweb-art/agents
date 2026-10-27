@@ -13,6 +13,7 @@ declare(strict_types=1);
 require dirname(__DIR__).'/bootstrap.php';
 
 use Workspace\Agents\Kernel\AgentContext;
+use Workspace\Agents\Support\Git;
 use Workspace\Agents\Support\Paths;
 use Workspace\Agents\Support\Process;
 
@@ -46,7 +47,7 @@ $context = AgentContext::fromFile($workspaceFile);
 $failed = false;
 foreach (array_keys($context->projects()) as $name) {
     $root = $context->projectPath($name);
-    $hooks = Process::run(['git', 'rev-parse', '--git-path', 'hooks'], $root);
+    $hooks = Process::run([Git::binary(), 'rev-parse', '--git-path', 'hooks'], $root);
     if ($hooks['code'] !== 0) {
         echo "skip {$name}: not a git repository ({$root})\n";
         $failed = true;

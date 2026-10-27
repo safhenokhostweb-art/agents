@@ -5,10 +5,13 @@ declare(strict_types=1);
 namespace Workspace\Agents\Tests\Unit;
 
 use ReflectionClass;
+use RuntimeException;
 use Workspace\Agents\Support\ComposerProject;
+use Workspace\Agents\Support\Git;
 use Workspace\Agents\Support\Glob;
 use Workspace\Agents\Support\Json;
 use Workspace\Agents\Support\Paths;
+use Workspace\Agents\Support\Process;
 use Workspace\Agents\Support\TreeHasher;
 use Workspace\Agents\Tests\Support\WorkspaceFixture;
 use Workspace\Agents\Tests\TestCase;
@@ -62,7 +65,7 @@ final class SupportTest extends TestCase
     public function testContentHashMatchesRealWorkspaceLockFiles(): void
     {
         $checked = 0;
-        foreach (['saas-platform', 'customer-site'] as $project) {
+        foreach (['saas-platform', 'customer-site', 'deployment-system/service'] as $project) {
             $root = dirname(__DIR__, 3).'/'.$project;
             if (is_file($root.'/composer.json') && is_file($root.'/composer.lock')) {
                 $lock = Json::decodeFile($root.'/composer.lock');
@@ -117,6 +120,52 @@ final class SupportTest extends TestCase
             $this->assertSame(['src/b.php'], $diff['modified']);
         } finally {
             WorkspaceFixture::remove($root);
+        }
+    }
+
+    public function testGitBinaryPrefersOverrideThenPathThenFallbacks(): void
+    {
+        $windows = PHP_OS_FAMILY === 'Windows';
+        $separator = $windows ? '\\' : '/';
+        $root = sys_get_temp_dir().$separator.'agents-git-'.bin2hex(random_bytes(4));
+        $onPath = $root.$separator.'path'.$separator.($windows ? 'git.exe' : 'git');
+        $fallback = $root.$separator.'fallback'.$separator.'git';
+        try {
+            foreach ([$onPath, $fallback] as $file) {
+                @mkdir(dirname($file), 0777, true);
+                file_put_contents($file, '');
+                chmod($file, 0755);
+            }
+            $missing = $root.$separator.'missing';
+            $pathList = implode($windows ? ';' : ':', [$missing, '"'.dirname($onPath).$separator.'"']);
+            $this->assertSame('/opt/git', Git::findBinary('/opt/git', $pathList, $windows, [$fallback]));
+            $this->assertSame($onPath, Git::findBinary('', $pathList, $windows, [$fallback]));
+            $this->assertSame($fallback, Git::findBinary('', $missing, $windows, [$missing.$separator.'git', $fallback]));
+            $this->assertNull(Git::findBinary('', '', $windows, [$missing.$separator.'git']));
+        } finally {
+            WorkspaceFixture::remove($root);
+        }
+    }
+
+    public function testGitStartsWhenServerPathLacksGit(): void
+    {
+        if (PHP_OS_FAMILY !== 'Windows') {
+            $this->skip('CreateProcess PATH lookup is Windows-specific');
+        }
+        $path = (string) getenv('PATH');
+        try {
+            // A web-server SAPI under Laragon: PHP is reachable, git is not.
+            putenv('PATH='.dirname(PHP_BINARY).';'.getenv('SystemRoot').'\\System32');
+            $this->assertThrows(RuntimeException::class, static fn () => Process::run(['git', '--version'], sys_get_temp_dir()), 'Cannot start process: git');
+            $binary = Git::findBinary('', (string) getenv('PATH'), true);
+            if ($binary === null) {
+                $this->skip('git is not installed in a standard Windows/Laragon location');
+            }
+            $result = Process::run([$binary, '--version'], sys_get_temp_dir());
+            $this->assertSame(0, $result['code'], $result['stderr']);
+            $this->assertStringContains('git version', $result['stdout']);
+        } finally {
+            putenv('PATH='.$path);
         }
     }
 

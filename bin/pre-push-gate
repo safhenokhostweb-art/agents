@@ -16,6 +16,7 @@ use Workspace\Agents\Agents\DependencyDeployment\DependencyDeploymentAgent;
 use Workspace\Agents\Kernel\Runtime;
 use Workspace\Agents\Kernel\Status;
 use Workspace\Agents\Kernel\Task;
+use Workspace\Agents\Support\Git;
 use Workspace\Agents\Support\Paths;
 use Workspace\Agents\Support\Process;
 
@@ -34,7 +35,7 @@ $say = static function (string $line): void {
 
 try {
     $runtime = Runtime::boot($options['workspace'] ?? $base.'/workspace.json', $options['registry'] ?? $base.'/agents.json');
-    $top = Paths::normalize(trim(Process::run(['git', 'rev-parse', '--show-toplevel'], (string) getcwd())['stdout']));
+    $top = Paths::normalize(trim(Process::run([Git::binary(), 'rev-parse', '--show-toplevel'], (string) getcwd())['stdout']));
     $project = null;
     foreach (array_keys($runtime->context->projects()) as $name) {
         if (Paths::relative($runtime->context->projectPath($name), $top) === '') {

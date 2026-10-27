@@ -12,8 +12,53 @@ use RuntimeException;
  */
 final class Git
 {
+    public const WINDOWS_FALLBACKS = [
+        'C:\\laragon\\bin\\git\\bin\\git.exe',
+        'C:\\laragon\\bin\\git\\cmd\\git.exe',
+        'C:\\Program Files\\Git\\bin\\git.exe',
+        'C:\\Program Files\\Git\\cmd\\git.exe',
+    ];
+
+    public const POSIX_FALLBACKS = ['/usr/bin/git', '/usr/local/bin/git', '/opt/homebrew/bin/git'];
+
+    private static ?string $binary = null;
+
     public function __construct(private readonly string $root)
     {
+    }
+
+    /**
+     * The git executable to spawn. Web-server SAPIs (Laragon's Apache/nginx)
+     * often run with a PATH that lacks git, and CreateProcess searches the
+     * parent's PATH, so a bare 'git' cannot start there. AGENTS_GIT_BINARY
+     * overrides the search; 'git' is the last resort.
+     */
+    public static function binary(): string
+    {
+        return self::$binary ??= self::findBinary((string) getenv('AGENTS_GIT_BINARY'), (string) getenv('PATH'), PHP_OS_FAMILY === 'Windows') ?? 'git';
+    }
+
+    /** @param list<string>|null $fallbacks */
+    public static function findBinary(string $override, string $path, bool $windows, ?array $fallbacks = null): ?string
+    {
+        if ($override !== '') {
+            return $override;
+        }
+        $separator = $windows ? '\\' : '/';
+        $candidates = [];
+        foreach (explode($windows ? ';' : ':', $path) as $directory) {
+            $directory = rtrim(trim($directory, " \""), '\\/');
+            if ($directory !== '') {
+                $candidates[] = $directory.$separator.($windows ? 'git.exe' : 'git');
+            }
+        }
+        foreach (array_merge($candidates, $fallbacks ?? ($windows ? self::WINDOWS_FALLBACKS : self::POSIX_FALLBACKS)) as $candidate) {
+            if (is_file($candidate) && ($windows || is_executable($candidate))) {
+                return $candidate;
+            }
+        }
+
+        return null;
     }
 
     public function isRepository(): bool
@@ -103,7 +148,7 @@ final class Git
     /** @param list<string> $arguments */
     public function run(array $arguments, bool $allowFailure = false): string
     {
-        $result = Process::run(array_merge(['git', '--no-optional-locks', '-c', 'core.quotepath=off'], $arguments), $this->root);
+        $result = Process::run(array_merge([self::binary(), '--no-optional-locks', '-c', 'core.quotepath=off'], $arguments), $this->root);
         if ($result['code'] !== 0 && ! $allowFailure) {
             throw new RuntimeException('git '.implode(' ', $arguments).' failed in '.$this->root.': '.trim($result['stderr']));
         }

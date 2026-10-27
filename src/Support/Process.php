@@ -17,9 +17,10 @@ final class Process
      */
     public static function run(array $command, string $cwd): array
     {
-        $process = proc_open($command, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, $cwd);
+        $process = @proc_open($command, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, $cwd);
         if (! is_resource($process)) {
-            throw new RuntimeException('Cannot start process: '.implode(' ', $command));
+            $reason = error_get_last()['message'] ?? 'unknown error';
+            throw new RuntimeException('Cannot start process: '.implode(' ', $command)." ({$reason})");
         }
         $stdout = stream_get_contents($pipes[1]);
         $stderr = stream_get_contents($pipes[2]);
