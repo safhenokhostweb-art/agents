@@ -1,7 +1,8 @@
 # Workspace Agents
 
 Runtime agents that operate across the workspace projects (`saas-platform`,
-`customer-site`) and hand prepared inputs to `deployment-system`. This file is
+`customer-site`, `deployment-system`) and hand prepared inputs to
+`deployment-system`, which is itself a target (self-deployment). This file is
 the canonical specification of the agent protocol. Coding-agent governance
 (Claude Code, Codex, …) stays in `saas-platform/AGENTS.md`; this system is
 software those coding agents run, not a replacement for that governance.
@@ -55,6 +56,15 @@ Bypassing it with `git push --no-verify` is an owner decision.
 
 On this machine PHP is not on the Git-Bash PATH; use
 `C:/laragon/bin/php/php-8.4.16-nts-Win32-vs17-x64/php.exe`.
+
+Git from a web server (the deployment-system canvas): the agent finds git
+via `AGENTS_GIT_BINARY`, then `PATH`, then standard locations (system Git
+before Laragon's bundled 2.37). Every git call carries
+`-c safe.directory=<project root>`, scoped to the root `workspace.json`
+declares, so a `.git` owned by `BUILTIN\Administrators` is not rejected as
+dubious when the global gitconfig is out of reach. That needs Git ≥ 2.38;
+older Git still needs the global `safe.directory` entry. `NOT_A_REPOSITORY`
+quotes git's own reason.
 
 ## Protocol
 
@@ -193,6 +203,25 @@ commits, pushes, or deploys. Its artifact is a sealed readiness report plus
 **Scope.** Dependency monitoring always covers every project in
 `workspace.json`; `payload.projects` only limits which projects get release
 drafts. Scoping never hides cross-project coupling.
+
+**Targets.** A project is a target when `workspace.json` declares it under
+`projects` (`agents.json` registers agents, not projects). Each entry has a
+`path`, a display `role`, and an optional `composer` directory, relative to
+the project, holding its `composer.json` when that is not the git root.
+Production branch and remote always come from the project's own
+`.deployment/release-policy.json`.
+
+| Project | Role | Composer | Production ref |
+|---|---|---|---|
+| `saas-platform` | provider | `composer.json` | `origin/main` |
+| `customer-site` | consumer | `composer.json` | `origin/main` |
+| `deployment-system` | deployment | `service/composer.json` | `origin/master` |
+
+`deployment-system` releases itself: its drafts become
+`release-task.deployment-system.json`, and the `release-prepare.php` that
+checks them is in its own tree. It shares no Composer packages with the other
+projects, so it is last in `release_order` and its findings never change
+theirs. `bin/install-hooks` also installs the pre-push gate into it.
 
 | Code | Severity | Meaning |
 |---|---|---|

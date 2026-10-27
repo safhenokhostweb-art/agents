@@ -6,8 +6,31 @@
             "class": "Workspace\\Agents\\Agents\\DependencyDeployment\\DependencyDeploymentAgent",
             "enabled": true,
             "subscriptions": [
-                { "topic": "release.requested", "task": "deployment.readiness" }
+                {
+                    "topic": "release.requested",
+                    "task": "deployment.readiness"
+                }
             ]
         }
-    ]
+    ],
+    "dashboard": {
+        "schema": "agent-dashboard.layout/v1",
+        "positions": {
+            "dependency-deployment": {
+                "x": 80,
+                "y": 120
+            },
+            "release-preparer": {
+                "x": 515,
+                "y": 246
+            }
+        },
+        "edges": [
+            {
+                "source": "dependency-deployment",
+                "target": "release-preparer",
+                "label": null
+            }
+        ]
+    }
 }

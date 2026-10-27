@@ -3,7 +3,8 @@
     "root": "..",
     "projects": {
         "saas-platform": { "path": "saas-platform", "role": "provider" },
-        "customer-site": { "path": "customer-site", "role": "consumer" }
+        "customer-site": { "path": "customer-site", "role": "consumer" },
+        "deployment-system": { "path": "deployment-system", "role": "deployment", "composer": "service" }
     },
     "deployment_system": {
         "path": "deployment-system",
