@@ -65,7 +65,7 @@ final class DependencyDeploymentAgent extends AbstractAgent
 
         $snapshots = [];
         foreach (array_keys($declared) as $name) {
-            $snapshots[$name] = ProjectSnapshot::capture((string) $name, $context->projectPath((string) $name), (string) ($declared[$name]['role'] ?? 'project'));
+            $snapshots[$name] = ProjectSnapshot::capture((string) $name, $context->projectPath((string) $name), (string) ($declared[$name]['role'] ?? 'project'), $context->composerPath((string) $name));
         }
 
         $shared = (new SharedPackageAnalyzer())->analyze($snapshots);

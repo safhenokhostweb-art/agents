@@ -6,11 +6,18 @@ namespace Workspace\Agents\Support;
 
 final class Paths
 {
-    /** Forward-slash absolute form; resolved through realpath when the path exists. */
+    /**
+     * Forward-slash absolute form with an uppercase drive letter (git prints
+     * C:/…, shells and IDEs pass c:\…); resolved through realpath when the
+     * path exists.
+     */
     public static function normalize(string $path): string
     {
         $real = realpath($path);
         $path = str_replace('\\', '/', $real === false ? $path : $real);
+        if (preg_match('#^[a-z]:(/|$)#', $path) === 1) {
+            $path = strtoupper($path[0]).substr($path, 1);
+        }
 
         return $path === '/' ? $path : rtrim($path, '/');
     }

@@ -34,7 +34,7 @@ final class AgentContext
         return new self(Paths::join(dirname(Paths::normalize($workspaceFile)), (string) ($config['root'] ?? '.')), $config);
     }
 
-    /** @return array<string, array{path: string, role?: string}> */
+    /** @return array<string, array{path: string, role?: string, composer?: string}> */
     public function projects(): array
     {
         return $this->config['projects'];
@@ -48,6 +48,25 @@ final class AgentContext
         }
 
         return Paths::join($this->workspaceRoot, (string) $project['path']);
+    }
+
+    /**
+     * Directory holding the project's composer.json: the git root unless the
+     * project declares a `composer` subdirectory (deployment-system keeps its
+     * only manifest in the Laravel app under service/).
+     */
+    public function composerPath(string $name): string
+    {
+        $root = $this->projectPath($name);
+        $directory = $this->config['projects'][$name]['composer'] ?? null;
+        if ($directory === null) {
+            return $root;
+        }
+        if (! is_string($directory) || $directory === '' || Paths::isAbsolute($directory) || preg_match('#(^|[/\\\\])\.\.([/\\\\]|$)#', $directory) === 1) {
+            throw new ProtocolException('PROJECT_INVALID', "Project '{$name}' composer directory must be a relative path inside the project.");
+        }
+
+        return Paths::join($root, $directory);
     }
 
     public function path(string $relative): string

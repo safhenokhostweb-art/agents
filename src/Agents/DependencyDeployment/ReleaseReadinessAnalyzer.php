@@ -6,6 +6,7 @@ namespace Workspace\Agents\Agents\DependencyDeployment;
 
 use Workspace\Agents\Kernel\Finding;
 use Workspace\Agents\Support\Glob;
+use Workspace\Agents\Support\Paths;
 
 /**
  * Pre-flight for deployment-system's release-prepare: classifies a project's
@@ -29,6 +30,8 @@ final class ReleaseReadinessAnalyzer
     {
         $findings = [];
         $riskFlags = [];
+        $directory = (string) Paths::relative($project->root, $project->composer->root);
+        $manifest = ($directory === '' ? '' : $directory.'/').'composer.json';
         $record = [
             'role' => $project->role,
             'branch' => $project->branch === '' ? null : $project->branch,
@@ -40,6 +43,7 @@ final class ReleaseReadinessAnalyzer
             'behind' => $project->behind,
             'dirty_entries' => $project->dirtyEntries,
             'composer' => [
+                'manifest' => $manifest,
                 'lock_in_sync' => $project->composer->lockInSync(),
                 'platform_php' => $project->composer->platformPhp(),
             ],
@@ -49,13 +53,14 @@ final class ReleaseReadinessAnalyzer
         if ($lock === false) {
             $findings[] = Finding::blocker(
                 'LOCK_OUT_OF_SYNC',
-                'composer.json changed without updating composer.lock (content-hash mismatch). A server-side composer install would warn and install the old dependency set.',
+                "{$manifest} changed without updating its composer.lock (content-hash mismatch). A server-side composer install would warn and install the old dependency set.",
                 $project->name,
-                remedy: 'Run composer update --lock (or the intended composer require/update) and commit both files together.',
+                ['manifest' => $manifest],
+                'Run composer update --lock (or the intended composer require/update) and commit both files together.',
             );
             $riskFlags[] = 'LOCK_OUT_OF_SYNC';
         } elseif ($lock === null) {
-            $findings[] = Finding::warning('LOCK_MISSING', 'No composer.lock; server installs are not reproducible.', $project->name);
+            $findings[] = Finding::warning('LOCK_MISSING', "No composer.lock beside {$manifest}; server installs are not reproducible.", $project->name);
         }
 
         $policy = $project->policy;

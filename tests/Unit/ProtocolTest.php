@@ -35,6 +35,24 @@ final class ProtocolTest extends TestCase
         WorkspaceFixture::remove($this->dir);
     }
 
+    public function testProjectComposerDirectoryDefaultsToTheRootAndStaysInsideIt(): void
+    {
+        mkdir($this->dir.'/app/service', 0777, true);
+        file_put_contents($this->dir.'/workspace.json', Json::encode(['schema' => AgentContext::SCHEMA, 'projects' => [
+            'root' => ['path' => 'app'],
+            'nested' => ['path' => 'app', 'composer' => 'service'],
+            'escape' => ['path' => 'app', 'composer' => '../other'],
+            'absolute' => ['path' => 'app', 'composer' => $this->dir],
+        ]]));
+        $context = AgentContext::fromFile($this->dir.'/workspace.json');
+
+        $this->assertSame($context->projectPath('root'), $context->composerPath('root'));
+        $this->assertSame($context->projectPath('nested').'/service', $context->composerPath('nested'));
+        $this->assertThrows(ProtocolException::class, static fn () => $context->composerPath('escape'), 'inside the project');
+        $this->assertThrows(ProtocolException::class, static fn () => $context->composerPath('absolute'), 'inside the project');
+        $this->assertThrows(ProtocolException::class, static fn () => $context->composerPath('nope'), 'not declared');
+    }
+
     public function testTaskRoundTripsThroughItsContract(): void
     {
         $task = Task::create('deployment.readiness', ['projects' => ['a']], 'dependency-deployment');

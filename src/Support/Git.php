@@ -12,11 +12,16 @@ use RuntimeException;
  */
 final class Git
 {
+    /**
+     * System Git first: Laragon bundles an older Git (2.37) that ignores
+     * command-line safe.directory, so outside a login environment it rejects
+     * Administrators-owned repositories as dubious.
+     */
     public const WINDOWS_FALLBACKS = [
-        'C:\\laragon\\bin\\git\\bin\\git.exe',
-        'C:\\laragon\\bin\\git\\cmd\\git.exe',
-        'C:\\Program Files\\Git\\bin\\git.exe',
         'C:\\Program Files\\Git\\cmd\\git.exe',
+        'C:\\Program Files\\Git\\bin\\git.exe',
+        'C:\\laragon\\bin\\git\\cmd\\git.exe',
+        'C:\\laragon\\bin\\git\\bin\\git.exe',
     ];
 
     public const POSIX_FALLBACKS = ['/usr/bin/git', '/usr/local/bin/git', '/opt/homebrew/bin/git'];
@@ -63,9 +68,28 @@ final class Git
 
     public function isRepository(): bool
     {
-        return is_dir($this->root)
-            && trim($this->run(['rev-parse', '--is-inside-work-tree'], true)) === 'true'
-            && Paths::relative(Paths::normalize(trim($this->run(['rev-parse', '--show-toplevel']))), $this->root) === '';
+        return $this->notRepositoryReason() === null;
+    }
+
+    /** Why the root is not the top level of a git work tree, or null when it is. */
+    public function notRepositoryReason(): ?string
+    {
+        if (! is_dir($this->root)) {
+            return 'directory does not exist';
+        }
+        $result = $this->exec(['rev-parse', '--show-toplevel']);
+        if ($result['code'] !== 0) {
+            // Drop warnings (e.g. about old-style safe.directory entries) so the fatal reason leads.
+            $lines = array_filter(array_map('trim', preg_split('/\R/', trim($result['stderr'])) ?: []), static fn (string $line): bool => $line !== '' && ! str_starts_with($line, 'warning:'));
+
+            return $lines === [] ? "git exited with code {$result['code']}" : implode(' ', $lines);
+        }
+        $top = trim($result['stdout']);
+        if (Paths::relative($top, $this->root) !== '') {
+            return "git reports the work tree top level as {$top}";
+        }
+
+        return null;
     }
 
     public function head(): ?string
@@ -148,12 +172,29 @@ final class Git
     /** @param list<string> $arguments */
     public function run(array $arguments, bool $allowFailure = false): string
     {
-        $result = Process::run(array_merge([self::binary(), '--no-optional-locks', '-c', 'core.quotepath=off'], $arguments), $this->root);
+        $result = $this->exec($arguments);
         if ($result['code'] !== 0 && ! $allowFailure) {
             throw new RuntimeException('git '.implode(' ', $arguments).' failed in '.$this->root.': '.trim($result['stderr']));
         }
 
         return $result['code'] === 0 ? $result['stdout'] : '';
+    }
+
+    /**
+     * safe.directory is scoped to this exact root, which workspace.json (owner
+     * config) declares, never '*'. It keeps a repository whose .git is owned by
+     * another account (e.g. BUILTIN\Administrators) readable when the global
+     * gitconfig that trusts it cannot be found, as under a web-server SAPI.
+     * Git honors it on the command line from 2.38 (protected configuration).
+     *
+     * @param  list<string>  $arguments
+     * @return array{code: int, stdout: string, stderr: string}
+     */
+    private function exec(array $arguments): array
+    {
+        $prefix = [self::binary(), '--no-optional-locks', '-c', 'core.quotepath=off', '-c', 'safe.directory='.Paths::normalize($this->root)];
+
+        return Process::run(array_merge($prefix, $arguments), $this->root);
     }
 
     /** @return list<string> */

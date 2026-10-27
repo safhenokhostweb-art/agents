@@ -169,6 +169,80 @@ final class SupportTest extends TestCase
         }
     }
 
+    public function testPathsNormalizeDriveLetterAndSlashes(): void
+    {
+        if (PHP_OS_FAMILY !== 'Windows') {
+            $this->skip('drive letters are Windows-specific');
+        }
+        $existing = Paths::normalize(sys_get_temp_dir());
+        $variant = str_replace('/', '\\', strtolower($existing[0]).substr($existing, 1));
+        $this->assertSame($existing, Paths::normalize($variant));
+        $this->assertSame('C:/nope/x', Paths::normalize('c:\\nope\\x\\'));
+        $this->assertSame('C:', Paths::normalize('c:'));
+        $this->assertSame('bar', Paths::relative('c:\\Foo', 'C:/foo/bar'));
+        $this->assertSame('', Paths::relative('c:\\laragon\\www\\saas-platform', 'C:/laragon/www/saas-platform'));
+    }
+
+    public function testGitReportsWhyARootIsNotTheRepositoryTopLevel(): void
+    {
+        $root = Paths::normalize(sys_get_temp_dir()).'/agents-gitroot-'.bin2hex(random_bytes(4));
+        try {
+            $this->assertSame('directory does not exist', (new Git($root))->notRepositoryReason());
+            mkdir($root.'/sub', 0777, true);
+            $this->assertStringContains('not a git repository', (string) (new Git($root))->notRepositoryReason());
+
+            Process::run([Git::binary(), 'init', '-q', $root], dirname($root));
+            $this->assertNull((new Git($root))->notRepositoryReason());
+            $this->assertTrue((new Git($root))->isRepository());
+            $this->assertStringContains('top level as '.$root, (string) (new Git($root.'/sub'))->notRepositoryReason());
+            if (PHP_OS_FAMILY === 'Windows') {
+                // How shells and IDEs spell the same root.
+                $this->assertTrue((new Git(str_replace('/', '\\', strtolower($root[0]).substr($root, 1))))->isRepository());
+            }
+        } finally {
+            WorkspaceFixture::remove($root);
+        }
+    }
+
+    public function testWindowsFallbacksPreferSystemGitOverLaragonBundledGit(): void
+    {
+        $order = array_map(static fn (string $p): bool => str_contains($p, 'Program Files'), Git::WINDOWS_FALLBACKS);
+        $this->assertSame([true, true, false, false], $order);
+    }
+
+    /**
+     * The canvas failure: the dashboard spawns bin/agent from the web server,
+     * whose environment has no git on PATH and no home directory, so git
+     * cannot read the global safe.directory that trusts repositories owned by
+     * BUILTIN\Administrators. Every real workspace project must still resolve.
+     */
+    public function testWorkspaceProjectsAreRepositoriesUnderAWebServerEnvironment(): void
+    {
+        if (PHP_OS_FAMILY !== 'Windows') {
+            $this->skip('web-server environment simulation is Windows-specific');
+        }
+        $workspace = dirname(__DIR__, 2).'/workspace.json';
+        $script = 'require '.var_export(dirname(__DIR__, 2).'/bootstrap.php', true).';'
+            .'$c = Workspace\Agents\Kernel\AgentContext::fromFile('.var_export($workspace, true).'); $r = [];'
+            .'foreach (array_keys($c->projects()) as $n) { $p = $c->projectPath($n); $r[$n] = is_dir($p) ? (new Workspace\Agents\Support\Git($p))->notRepositoryReason() : "absent"; }'
+            .'echo json_encode([Workspace\Agents\Support\Git::binary(), $r]);';
+        $env = ['SystemRoot' => (string) getenv('SystemRoot'), 'PATH' => dirname(PHP_BINARY).';'.getenv('SystemRoot').'\\System32', 'TEMP' => sys_get_temp_dir()];
+        $process = proc_open([PHP_BINARY, '-r', $script], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, sys_get_temp_dir(), $env, ['bypass_shell' => true]);
+        $stdout = (string) stream_get_contents($pipes[1]);
+        $stderr = (string) stream_get_contents($pipes[2]);
+        proc_close($process);
+
+        [$binary, $reasons] = Json::decode($stdout);
+        if ($binary === 'git') {
+            $this->skip('git is not installed in a standard Windows/Laragon location');
+        }
+        $reasons = array_filter($reasons, static fn (?string $reason): bool => $reason !== 'absent');
+        if ($reasons === []) {
+            $this->skip('no workspace projects are checked out beside agents/');
+        }
+        $this->assertSame(array_fill_keys(array_keys($reasons), null), $reasons, $stderr);
+    }
+
     public function testPathsRelative(): void
     {
         $base = Paths::normalize(sys_get_temp_dir());

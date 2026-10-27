@@ -147,7 +147,7 @@ final class SharedPackageAnalyzer
 
     private function installState(ProjectSnapshot $consumer, string $name, array $repository, string $subject): array
     {
-        $installed = $consumer->root.'/vendor/'.$name;
+        $installed = $consumer->composer->root.'/vendor/'.$name;
         if (! file_exists($installed)) {
             $this->add(Finding::warning(
                 'PACKAGE_NOT_INSTALLED',

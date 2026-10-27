@@ -34,17 +34,19 @@ final class ProjectSnapshot
     ) {
     }
 
-    public static function capture(string $name, string $root, string $role): self
+    /** @param  string|null  $composerRoot  directory of composer.json when it is not the git root */
+    public static function capture(string $name, string $root, string $role, ?string $composerRoot = null): self
     {
         if (! is_dir($root)) {
             throw new ProtocolException('PROJECT_MISSING', "Project '{$name}' directory does not exist: {$root}");
         }
         $git = new Git($root);
-        if (! $git->isRepository()) {
-            throw new ProtocolException('NOT_A_REPOSITORY', "Project '{$name}' is not the root of a git repository: {$root}");
+        $reason = $git->notRepositoryReason();
+        if ($reason !== null) {
+            throw new ProtocolException('NOT_A_REPOSITORY', "Project '{$name}' is not the root of a git repository: {$root} ({$reason})");
         }
         try {
-            $composer = ComposerProject::load($root);
+            $composer = ComposerProject::load($composerRoot ?? $root);
         } catch (\RuntimeException $exception) {
             throw new ProtocolException('COMPOSER_UNREADABLE', "Project '{$name}': ".$exception->getMessage());
         }

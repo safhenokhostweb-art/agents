@@ -29,16 +29,20 @@ use Workspace\Agents\Support\Process;
  *                   symlink:false, so vendor/ holds a mirrored copy
  *   remotes/        bare origins, so origin/main refs and fetches are real
  *   deployment-system/deployment/release-prepare.php  (handoff tool stub)
+ *
+ * With $withDeploymentSystem, deployment-system is a third project releasing
+ * itself: production branch master, Composer manifest under service/.
  */
 final class WorkspaceFixture
 {
     public const PROVIDER = 'saas-platform';
     public const CONSUMER = 'customer-site';
+    public const DEPLOYMENT = 'deployment-system';
     public const PACKAGE = 'saas-platform/core-utils';
 
     public readonly string $root;
 
-    public function __construct()
+    public function __construct(bool $withDeploymentSystem = false)
     {
         $root = sys_get_temp_dir().'/agents-ws-'.bin2hex(random_bytes(5));
         mkdir($root, 0777, true);
@@ -70,14 +74,25 @@ final class WorkspaceFixture
         $this->initRepository(self::CONSUMER);
         $this->mirrorPackage();
 
-        $this->write('deployment-system', 'deployment/release-prepare.php', "<?php\n// fixture stub\n");
+        $this->write(self::DEPLOYMENT, 'deployment/release-prepare.php', "<?php\n// fixture stub\n");
+        $projects = [
+            self::PROVIDER => ['path' => self::PROVIDER, 'role' => 'provider'],
+            self::CONSUMER => ['path' => self::CONSUMER, 'role' => 'consumer'],
+        ];
+        if ($withDeploymentSystem) {
+            $this->composer(self::DEPLOYMENT, [
+                'name' => 'laravel/laravel',
+                'require' => ['php' => '^8.2', 'laravel/framework' => '^12.0'],
+            ], ['laravel/framework' => 'v12.1.0'], 'service');
+            $this->write(self::DEPLOYMENT, 'service/app/Hub.php', "<?php\n\nreturn 'hub';\n");
+            $this->policy(self::DEPLOYMENT, 'master', ['.deployment/**', 'deployment/**', 'service/**'], ['service/vendor/**', 'service/storage/**', '**/*.log'], 'service/');
+            $this->initRepository(self::DEPLOYMENT, 'master');
+            $projects[self::DEPLOYMENT] = ['path' => self::DEPLOYMENT, 'role' => 'deployment', 'composer' => 'service'];
+        }
         file_put_contents($this->root.'/workspace.json', Json::encode([
             'schema' => AgentContext::SCHEMA,
             'root' => '.',
-            'projects' => [
-                self::PROVIDER => ['path' => self::PROVIDER, 'role' => 'provider'],
-                self::CONSUMER => ['path' => self::CONSUMER, 'role' => 'consumer'],
-            ],
+            'projects' => $projects,
             'deployment_system' => ['path' => 'deployment-system', 'release_prepare' => 'deployment-system/deployment/release-prepare.php'],
             'runtime' => ['artifacts' => 'var/artifacts', 'journal' => 'var/bus/journal.jsonl'],
         ]));
@@ -98,19 +113,19 @@ final class WorkspaceFixture
     }
 
     /** Writes composer.json and a composer.lock whose content-hash matches it. */
-    public function composer(string $project, array $manifest, array $locked): void
+    public function composer(string $project, array $manifest, array $locked, string $directory = ''): void
     {
-        $this->write($project, 'composer.json', Json::encode($manifest));
-        $this->lock($project, $manifest, $locked);
+        $this->write($project, ($directory === '' ? '' : $directory.'/').'composer.json', Json::encode($manifest));
+        $this->lock($project, $manifest, $locked, $directory);
     }
 
-    public function lock(string $project, array $manifest, array $locked): void
+    public function lock(string $project, array $manifest, array $locked, string $directory = ''): void
     {
         $packages = [];
         foreach ($locked as $name => $version) {
             $packages[] = ['name' => $name, 'version' => $version];
         }
-        $this->write($project, 'composer.lock', Json::encode([
+        $this->write($project, ($directory === '' ? '' : $directory.'/').'composer.lock', Json::encode([
             'content-hash' => ComposerProject::contentHash($manifest),
             'packages' => $packages,
             'packages-dev' => [],
@@ -201,40 +216,45 @@ final class WorkspaceFixture
         rmdir($path);
     }
 
-    private function policy(string $project): void
+    /**
+     * @param  list<string>|null  $allowed  defaults to the provider/consumer layout
+     * @param  list<string>|null  $excluded
+     * @param  string  $app  prefix of the Composer app (database/, composer.json)
+     */
+    private function policy(string $project, string $branch = 'main', ?array $allowed = null, ?array $excluded = null, string $app = ''): void
     {
         $this->write($project, '.deployment/release-policy.json', Json::encode([
             'schema_version' => 1,
             'project_key' => $project,
-            'production_branch' => 'main',
+            'production_branch' => $branch,
             'remote' => 'origin',
-            'allowed_release_paths' => ['.deployment/**', 'packages/**', 'src/**', 'database/**', 'composer.json', 'composer.lock'],
-            'excluded_runtime_paths' => ['vendor/**', 'storage/**', '**/*.log'],
+            'allowed_release_paths' => $allowed ?? ['.deployment/**', 'packages/**', 'src/**', 'database/**', 'composer.json', 'composer.lock'],
+            'excluded_runtime_paths' => $excluded ?? ['vendor/**', 'storage/**', '**/*.log'],
             'required_clean_state' => ['no_pre_staged_changes' => true],
             'checks' => [],
-            'migration_policy' => ['paths' => ['database/migrations/**'], 'review_required_patterns' => ['dropColumn\\s*\\(', 'Schema::drop\\s*\\(']],
-            'dependency_rules' => [['when' => 'composer.json', 'requires' => 'composer.lock']],
+            'migration_policy' => ['paths' => [$app.'database/migrations/**'], 'review_required_patterns' => ['dropColumn\\s*\\(', 'Schema::drop\\s*\\(']],
+            'dependency_rules' => [['when' => $app.'composer.json', 'requires' => $app.'composer.lock']],
             'build' => ['required' => true, 'artifact' => 'server-managed-exact-commit'],
             'health' => ['required' => true, 'endpoint_source' => 'fixture'],
             'metadata' => ['local_directory' => '.git/deployment/releases'],
         ]));
     }
 
-    private function initRepository(string $project): void
+    private function initRepository(string $project, string $branch = 'main'): void
     {
         $this->write($project, '.gitignore', "/vendor/\n/.deployment/release-task.json\n");
-        $this->git($project, 'init', '-q', '-b', 'main');
+        $this->git($project, 'init', '-q', '-b', $branch);
         $this->git($project, 'config', 'user.name', 'Agents Fixture');
         $this->git($project, 'config', 'user.email', 'agents@example.test');
         $this->git($project, 'config', 'core.autocrlf', 'false');
         $remote = $this->root.'/remotes/'.$project.'.git';
-        $result = Process::run(['git', 'init', '-q', '--bare', '-b', 'main', $remote], $this->root);
+        $result = Process::run(['git', 'init', '-q', '--bare', '-b', $branch, $remote], $this->root);
         if ($result['code'] !== 0) {
             throw new RuntimeException('Cannot create bare remote: '.$result['stderr']);
         }
         $this->git($project, 'remote', 'add', 'origin', $remote);
         $this->git($project, 'add', '-A');
         $this->git($project, 'commit', '-q', '-m', 'baseline');
-        $this->git($project, 'push', '-q', '-u', 'origin', 'main');
+        $this->git($project, 'push', '-q', '-u', 'origin', $branch);
     }
 }
