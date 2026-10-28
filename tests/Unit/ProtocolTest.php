@@ -144,6 +144,20 @@ final class ProtocolTest extends TestCase
         $this->assertThrows(ProtocolException::class, fn () => new Artifact('Bad Kind', []));
         $this->assertThrows(ProtocolException::class, fn () => new Artifact('report', [], [], ['../escape.json' => []]));
         $this->assertThrows(ProtocolException::class, fn () => new Artifact('report', [], [], ['notes.txt' => []]));
+        $this->assertThrows(ProtocolException::class, fn () => new Artifact('report', [], [], [], '../audit'));
+    }
+
+    public function testArtifactNamePrefixesItsIdWithinTheKindDirectory(): void
+    {
+        $store = new ArtifactStore($this->dir.'/artifacts');
+        $agent = new ScriptedAgent('producer', ['x.y']);
+
+        $named = $store->persist(new Artifact('report', [], [], [], 'audit'), Task::create('x.y'), $agent);
+        $this->assertTrue(preg_match('/^audit-\d{8}T\d{6}-[0-9a-f]{8}$/', $named['artifact_id']) === 1);
+        $this->assertSame($this->dir.'/artifacts/report/'.$named['artifact_id'].'/artifact.json', $named['path']);
+
+        $default = $store->persist(new Artifact('report', []), Task::create('x.y'), $agent);
+        $this->assertStringContains('report-', $default['artifact_id']);
     }
 
     public function testBaseAgentValidatesPayloadAndContainsFailures(): void

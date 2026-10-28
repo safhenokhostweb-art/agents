@@ -14,6 +14,9 @@ use Workspace\Agents\Support\Json;
  *   <root>/<kind>/<artifact_id>/artifact.json
  *   <root>/<kind>/<artifact_id>/<attachment>.json
  *
+ * where <artifact_id> is <name>-<utc timestamp>-<random> and <name> is the
+ * artifact's name, or its kind when it has none.
+ *
  * The envelope digest is sha256 over the canonical JSON of the envelope
  * without its `integrity` block; each attachment's sha256 is recorded inside
  * the envelope, so one digest seals the whole artifact.
@@ -29,7 +32,7 @@ final class ArtifactStore
     /** @return array{artifact_id: string, kind: string, path: string, digest: string} */
     public function persist(Artifact $artifact, Task $task, Agent $producer): array
     {
-        $id = Id::new($artifact->kind);
+        $id = Id::new($artifact->name ?? $artifact->kind);
         $directory = $this->root.'/'.$artifact->kind.'/'.$id;
         if (! mkdir($directory, 0775, true) && ! is_dir($directory)) {
             throw new RuntimeException("Cannot create artifact directory: {$directory}");

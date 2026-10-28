@@ -61,6 +61,11 @@ final class AgentRegistry
             if (! in_array($task, $agent->handles(), true)) {
                 throw new RuntimeException("Agent '{$id}' subscribes with task type '{$task}' it does not handle.");
             }
+            // A topic no Message can carry would be a subscription that never fires.
+            $topic = (string) ($subscription['topic'] ?? '');
+            if ($topic !== '*' && preg_match(Task::NAME_PATTERN, str_ends_with($topic, '.*') ? substr($topic, 0, -2).'.x' : $topic) !== 1) {
+                throw new RuntimeException("Agent '{$id}' subscribes to topic '{$topic}', which is not a valid dotted lowercase topic or prefix pattern.");
+            }
             $this->subscriptions[] = ['agent' => $id, 'topic' => (string) $subscription['topic'], 'task' => $task];
         }
         $this->agents[$id] = $agent;

@@ -17,7 +17,7 @@ agents/
   bin/agent          CLI
   src/Kernel/        the protocol (contracts, bus, orchestrator, artifact store)
   src/Support/       read-only helpers (git, composer, globbing, hashing, semver)
-  src/Agents/<Name>/ one directory per agent
+  src/Agents/<Name>/ one directory per agent (DependencyDeployment, SentinelVerifier)
   tests/             zero-dependency runner, unit + integration suites
   var/               runtime output (gitignored): artifacts/, bus/journal.jsonl
 ```
@@ -29,13 +29,16 @@ php agents/bin/agent list
 php agents/bin/agent run deployment.readiness                       # whole workspace
 php agents/bin/agent run deployment.readiness --payload='{"projects":["saas-platform"],"task_id":"WU-42"}'
 php agents/bin/agent dispatch path/to/task.json                     # a Task contract file
+php agents/bin/agent publish deployment.completed --payload-file=event.json   # an external event; its subscribers run
 php agents/bin/agent verify agents/var/artifacts/<kind>/<id>/artifact.json
 php agents/bin/agent journal --correlation=<id>
 php agents/tests/run.php [filter]
 ```
 
-`run`/`dispatch` accept `--json` (machine output), `--verbose` (show info
-findings) and `--strict`. Exit codes: `0` PASS, `1` FAILED or runtime error,
+`run`/`dispatch`/`publish` accept `--json` (machine output), `--verbose` (show info
+findings) and `--strict`; `run` and `publish` take the payload inline
+(`--payload`) or from a JSON file (`--payload-file`, easier than quoting JSON
+in PowerShell). Exit codes: `0` PASS, `1` FAILED or runtime error,
 `2` BLOCKED, `3` PASS but a verdict other than `READY` (`--strict` only).
 
 ### Pre-push gate
@@ -146,6 +149,10 @@ delivery, so other processes can replay a run.
 
 A matching message becomes a new task for that agent (`payload` = message
 payload, `hop` = message hop + 1) and runs in the same dispatch, breadth-first.
+A subscription topic must be one a message can carry (dotted lowercase,
+`a.*` prefix, or `*`); the registry refuses any other, since it could never
+fire. Systems outside the runtime announce events with `bin/agent publish`
+(`Orchestrator::publish()`, source `external`).
 An agent is never triggered by its own messages, and tasks deeper than
 `maxHops` (default 8) are rejected with `HOP_LIMIT`.
 
@@ -184,6 +191,10 @@ over the canonical (key-sorted, compact) JSON of the envelope without its
 | `release.requested` | topic (subscribed) | → `deployment.readiness` | same as the task payload |
 | `deployment.readiness.reported` | topic | dependency-deployment | `verdict`, `counts`, `projects`, `drafts` |
 | `dependency.drift.detected` | topic | dependency-deployment | `packages: [{package, consumer, provider, modified, missing, extra}]` |
+| `sentinel.verify` | task | sentinel-verifier | see [Sentinel Verifier](#sentinel-verifier-sentinel-verifier) |
+| `deployment.completed` | topic (subscribed) | → `sentinel.verify` | same as the task payload |
+| `sentinel.audit-requested` | topic (subscribed) | → `sentinel.verify` | same as the task payload |
+| `sentinel.verification.passed` / `.failed` | topics | sentinel-verifier | `project_key`, `environment`, `release_id`, `commit_sha`, `deployment_id`, `status`, `sentinel_verdict`, `verdict`, `evidence_hash`, `snapshot_hash`, `non_conformant_files`, `reasons` |
 | `task.*`, `artifact.created` | topics | orchestrator | see lifecycle table |
 
 ## Dependency & Deployment Agent (`dependency-deployment`)
@@ -254,3 +265,113 @@ agent never fetches; provenance records the ref used). Constraint checks
 cover the Composer subset in `Support/VersionConstraint.php` and report
 `CONSTRAINT_UNVERIFIED` rather than guess. A full workspace run takes about
 15 s, mostly hashing mirrored package trees.
+
+## Sentinel Verifier (`sentinel-verifier`)
+
+Audits one deployment's proof chain — commit → artifact → Hub release →
+Server Agent → active runtime → health — from explicit evidence files and
+seals the result as a `sentinel` artifact.
+
+**Boundary.** The core (`EvidenceContract`, `RuntimeEvidenceContract`,
+`EvidenceVerifier`, `FileManifestComparison`) is a port of
+deployment-system's `service/app/Services/Sentinel`. The Hub keeps its own
+copy for the deployment page and `sentinel_verification_runs`, and
+production Hub hosts have no `agents` checkout, so the Hub classes were not
+removed (that would need an ADR, Constitution §12).
+`tests/Integration/SentinelParityTest` runs both on the same inputs —
+verdicts, every check detail, evidence hashes, contract refusals and the
+Server Agent's file-manifest hash — so they cannot drift silently. Per
+deployment-system's `ADR-SENTINEL-BOUNDARIES-DRAFT.md` the agent is a
+read-only consumer of explicit evidence: no Hub database, no network, no
+health probe, never follows a link or junction out of a release, writes only
+its artifact. Missing or uninterpretable evidence is `UNKNOWN`, never a pass.
+
+**Inputs** (`sentinel.verify` payload; paths are relative to the workspace
+root or absolute, `.json` only, at most 16 MiB):
+
+| Key | Meaning |
+|---|---|
+| `evidence` | `sentinel.v1` evidence document as the Hub collects it; re-verified with the Hub's rules |
+| `snapshot` | `sentinel.runtime.v1` Server Agent runtime snapshot |
+| `expected_manifest` | the artifact's `.deployment/file-manifest.json` (seal re-checked) |
+| `observed_manifest` *or* `release_dir` | the active release: another manifest, or the release directory re-hashed read-only (≤ 50 000 files / 1 GiB) |
+| `exclude` | release-relative globs for runtime-owned paths (`storage/**`, …); `.deployment/runtime-marker` is always excluded |
+| `project_key`, `environment`, `release_id`, `deployment_id`, `commit_sha`, `artifact_checksum_sha256`, `agent_id` | the expectation: what the deployment *should* be. Never inferred from the evidence; without `release_id` nothing is attributable |
+| `file_verification` | enable the Hub's feature-flagged file-level checks (default `false`, as on the Hub) |
+| `min_agent_version` | fail snapshots from an older Server Agent, e.g. `1.4.3` (no floor by default) |
+| `max_snapshot_age_seconds` | snapshot freshness window (default 300, the Hub's) — measured against the evidence's `verified_at`, or now without evidence |
+
+At least one of `evidence`/`snapshot` is required (`EVIDENCE_MISSING`
+otherwise). A malformed request is `BLOCKED` and emits no verification event.
+
+**Checks**, in four sections, each `pass` / `fail` / `unknown`:
+
+- `evidence.*` — exactly the Hub verifier's checks (commit, artifact checksum,
+  release and agent identity, `releases/{deployment_id}` path, runtime
+  marker, health, recorded checks, `verified_at`, alignment).
+- `snapshot.*` — version, completeness, optional agent-version floor,
+  freshness, release path, **deployment marker** (`release:{deployment_id}|commit:{sha}`
+  must name the reported deployment and the release-manifest commit),
+  attribution, and with `file_verification` the agent's on-disk file
+  observation.
+- `agreement.evidence_snapshot_agreement` — the evidence and the snapshot
+  must describe the same runtime observation.
+- `files.*` — the expected manifest must be the one the evidence or snapshot
+  records (`manifest_binding`), then a per-file comparison: `MISSING` /
+  `HASH_MISMATCH` fail; `EXTRA` and `UNREADABLE` are unknown until an
+  exclusion covers them.
+
+Verdict: any `fail` → `FAILED`, else any `unknown` → `UNKNOWN`, else
+`VERIFIED`. Findings: `SENTINEL_CHECK_FAILED` (blocker, subject
+`section.check`), `SENTINEL_CHECK_UNKNOWN` (warning), `SENTINEL_VERIFIED`
+(info). So `data.verdict` and the dashboard read `READY` / `ATTENTION` /
+`BLOCKED`, and `--strict` exits `3` unless verified; `data.sentinel_verdict`
+holds `VERIFIED` / `FAILED` / `UNKNOWN`, and `data.status` the binary audit
+status: `PASSED` only when `VERIFIED`, otherwise `FAILED` (`UNKNOWN` fails
+closed). Event: `sentinel.verification.passed` when `PASSED`, otherwise
+`sentinel.verification.failed`.
+
+**Artifact** `var/artifacts/sentinel/audit-<timestamp>-<random>/artifact.json`,
+payload `sentinel.audit-report/v1`: `status`, `sentinel_verdict`, `verdict`,
+`checked_at`, `reference_time`, `target` (project, environment, release,
+commit, deployment), `expectation`, `evidence_hash` (canonical
+`sentinel.v1` hash — equal to the Hub's —, snapshot hash, and sha256 of every
+input file), per-section checks, `runtime_evidence` (snapshot verdict,
+`snapshot_status`, agent version, deployment-marker check, snapshot hash;
+`null` without a snapshot), `files` counts and manifest hashes,
+`non_conformant_files` (path, outcome, expected/observed size and sha256;
+first 1000, `non_conformant_total` is exact), `reasons`, `findings`. The
+canonical evidence and snapshot are sealed beside it as `evidence.json` and
+`runtime-snapshot.json`. Credential-like paths (`.env*`, `*.pem`, `*.key`,
+`auth.json`, `*secret*`, `*token*`, …) are reported as `[redacted:<hash>]`
+without hashes; a rejected document's message never echoes a secret.
+
+**Dashboard.** The registry entry's `subscriptions` are the node's input port
+(`deployment.completed`, `sentinel.audit-requested`); `produces` declares its
+output topics and artifact kind. The canvas keeps both when it saves. Topic
+segments are `[a-z0-9-]` (`Task::NAME_PATTERN`), so the audit request topic is
+`sentinel.audit-requested`; `sentinel.audit_requested` is rejected at
+registration because no message could ever carry it.
+
+**Local test.**
+
+```powershell
+# 1. Fail closed without evidence (exit 2, EVIDENCE_MISSING)
+php agents/bin/agent run sentinel.verify --target=sentinel-verifier
+
+# 2. A real audit: task file with payload paths (see the table above)
+php agents/bin/agent run sentinel.verify --target=sentinel-verifier --payload-file=audit.json --verbose
+
+# 3. As the deployment pipeline would trigger it
+php agents/bin/agent publish deployment.completed --payload-file=audit.json
+
+# 4. Check the sealed report
+php agents/bin/agent verify agents/var/artifacts/sentinel/audit-<timestamp>-<random>/artifact.json
+php agents/tests/run.php Sentinel
+```
+
+**Limits.** The Hub's monotonic snapshot `sequence` watermark and HMAC
+signature are checked at ingest and are not available offline, so a
+snapshot file is trusted only as far as its contents and its binding to the
+evidence. The deployment-system repository's Server Agent declares
+`AGENT_VERSION = '1.4.2'`; pass `min_agent_version` to require a newer one.

@@ -6,6 +6,7 @@ namespace Workspace\Agents\Kernel;
 
 use LogicException;
 use Throwable;
+use Workspace\Agents\Support\Id;
 
 /**
  * Runs tasks and performs every side effect agents declare.
@@ -20,6 +21,9 @@ use Throwable;
 final class Orchestrator
 {
     public const SOURCE = 'orchestrator';
+
+    /** Source of messages published into the runtime from outside it. */
+    public const EXTERNAL = 'external';
 
     /** @var list<Task> */
     private array $queue = [];
@@ -46,13 +50,38 @@ final class Orchestrator
     /** @return list<Outcome> every task executed, the dispatched task first */
     public function dispatch(Task $task): array
     {
+        return $this->run(function () use ($task): void {
+            $this->queue = [$task];
+        });
+    }
+
+    /**
+     * Publish a message from outside the runtime (e.g. deployment-system
+     * announcing deployment.completed) and run every task its subscribers
+     * derive from it, breadth-first, exactly as for an agent's own events.
+     *
+     * @return list<Outcome> every task executed; empty when nothing subscribes
+     */
+    public function publish(string $topic, array $payload, string $source = self::EXTERNAL): array
+    {
+        $message = Message::create($topic, $payload, $source, Id::new('event'));
+
+        return $this->run(function () use ($message): void {
+            $this->bus->publish($message);
+        });
+    }
+
+    /** @return list<Outcome> */
+    private function run(callable $seed): array
+    {
         if ($this->running) {
-            throw new LogicException('Orchestrator::dispatch() is not re-entrant; return follow-up tasks from the Result instead.');
+            throw new LogicException('Orchestrator is not re-entrant; return follow-up tasks from the Result instead.');
         }
         $this->running = true;
-        $this->queue = [$task];
+        $this->queue = [];
         $outcomes = [];
         try {
+            $seed();
             while (($next = array_shift($this->queue)) !== null) {
                 $outcomes[] = $this->execute($next);
             }

@@ -11,23 +11,56 @@
                     "task": "deployment.readiness"
                 }
             ]
+        },
+        {
+            "id": "sentinel-verifier",
+            "class": "Workspace\\Agents\\Agents\\SentinelVerifier\\SentinelVerifierAgent",
+            "enabled": true,
+            "subscriptions": [
+                {
+                    "topic": "deployment.completed",
+                    "task": "sentinel.verify"
+                },
+                {
+                    "topic": "sentinel.audit-requested",
+                    "task": "sentinel.verify"
+                }
+            ],
+            "produces": {
+                "artifacts": [
+                    "sentinel"
+                ],
+                "events": [
+                    "sentinel.verification.passed",
+                    "sentinel.verification.failed"
+                ]
+            }
         }
     ],
     "dashboard": {
         "schema": "agent-dashboard.layout/v1",
         "positions": {
             "dependency-deployment": {
-                "x": 80,
-                "y": 120
+                "x": 49,
+                "y": 28
             },
             "release-preparer": {
-                "x": 515,
-                "y": 246
+                "x": 598,
+                "y": 228
+            },
+            "sentinel-verifier": {
+                "x": 42,
+                "y": 293
             }
         },
         "edges": [
             {
                 "source": "dependency-deployment",
+                "target": "release-preparer",
+                "label": null
+            },
+            {
+                "source": "sentinel-verifier",
                 "target": "release-preparer",
                 "label": null
             }

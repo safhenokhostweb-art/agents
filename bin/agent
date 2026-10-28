@@ -18,8 +18,9 @@ Workspace agent runtime
 
 Usage:
   php agents/bin/agent list
-  php agents/bin/agent run <task-type> [--payload='{"k":"v"}'] [--target=<agent-id>] [--json] [--strict] [--verbose]
+  php agents/bin/agent run <task-type> [--payload='{"k":"v"}' | --payload-file=<file>] [--target=<agent-id>] [--json] [--strict] [--verbose]
   php agents/bin/agent dispatch <task.json> [--json] [--strict] [--verbose]
+  php agents/bin/agent publish <topic> [--payload='{"k":"v"}' | --payload-file=<file>] [--json] [--strict] [--verbose]
   php agents/bin/agent verify <artifact.json>
   php agents/bin/agent journal [--correlation=<id>]
 
@@ -63,18 +64,23 @@ try {
                 throw new InvalidArgumentException('Missing '.($positional[0] === 'run' ? '<task-type>' : '<task.json>').'.');
             }
             $task = $positional[0] === 'run'
-                ? Task::create($positional[1], isset($options['payload']) ? Json::decode((string) $options['payload'], '--payload') : [], isset($options['target']) ? (string) $options['target'] : null)
+                ? Task::create($positional[1], payloadOption($options), isset($options['target']) ? (string) $options['target'] : null)
                 : Task::fromArray(Json::decodeFile($positional[1]));
             $runtime = Runtime::boot($workspaceFile, $registryFile);
             $outcomes = $runtime->orchestrator->dispatch($task);
-            if (isset($options['json'])) {
-                echo Json::encode(array_map(static fn (Outcome $o): array => $o->toArray(), $outcomes)), "\n";
-            } else {
-                foreach ($outcomes as $outcome) {
-                    printOutcome($outcome, isset($options['verbose']));
-                }
-                echo "correlation: {$task->correlationId}\njournal:     {$runtime->journalPath}\n";
+            printOutcomes($outcomes, $options, $runtime->journalPath);
+            exit(exitCode($outcomes, isset($options['strict'])));
+
+        case 'publish':
+            if (! isset($positional[1])) {
+                throw new InvalidArgumentException('Missing <topic>.');
             }
+            $runtime = Runtime::boot($workspaceFile, $registryFile);
+            $outcomes = $runtime->orchestrator->publish($positional[1], payloadOption($options));
+            if ($outcomes === [] && ! isset($options['json'])) {
+                echo "No agent subscribes to {$positional[1]}; the message was journaled only.\n";
+            }
+            printOutcomes($outcomes, $options, $runtime->journalPath);
             exit(exitCode($outcomes, isset($options['strict'])));
 
         case 'verify':
@@ -96,6 +102,35 @@ try {
 } catch (Throwable $exception) {
     fwrite(STDERR, 'error: '.$exception->getMessage().PHP_EOL);
     exit(1);
+}
+
+function payloadOption(array $options): array
+{
+    if (isset($options['payload'], $options['payload-file'])) {
+        throw new InvalidArgumentException('Use either --payload or --payload-file, not both.');
+    }
+    if (isset($options['payload-file'])) {
+        return Json::decodeFile((string) $options['payload-file']);
+    }
+
+    return isset($options['payload']) ? Json::decode((string) $options['payload'], '--payload') : [];
+}
+
+/** @param list<Outcome> $outcomes */
+function printOutcomes(array $outcomes, array $options, string $journalPath): void
+{
+    if (isset($options['json'])) {
+        echo Json::encode(array_map(static fn (Outcome $o): array => $o->toArray(), $outcomes)), "\n";
+
+        return;
+    }
+    foreach ($outcomes as $outcome) {
+        printOutcome($outcome, isset($options['verbose']));
+    }
+    if ($outcomes !== []) {
+        echo "correlation: {$outcomes[0]->task->correlationId}\n";
+    }
+    echo "journal:     {$journalPath}\n";
 }
 
 function printOutcome(Outcome $outcome, bool $verbose): void

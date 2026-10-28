@@ -146,13 +146,43 @@ final class OrchestratorTest extends TestCase
         $registry->register(new ScriptedAgent('one', ['a.b']));
         $this->assertThrows(RuntimeException::class, fn () => $registry->register(new ScriptedAgent('one', ['a.b'])), 'already registered');
         $this->assertThrows(RuntimeException::class, fn () => $registry->register(new ScriptedAgent('two', ['a.b']), [['topic' => 'x.y', 'task' => 'c.d']]), 'does not handle');
+        // A topic no Message can carry is a subscription that would never fire.
+        foreach (['sentinel.audit_requested', 'Deployment.completed', 'single', 'a.*.b', ''] as $topic) {
+            $this->assertThrows(RuntimeException::class, fn () => (new AgentRegistry())->register(new ScriptedAgent('three', ['a.b']), [['topic' => $topic, 'task' => 'a.b']]), 'not a valid dotted lowercase topic');
+        }
+        foreach (['*', 'a.*', 'deployment.completed', 'sentinel.audit-requested'] as $topic) {
+            (new AgentRegistry())->register(new ScriptedAgent('four', ['a.b']), [['topic' => $topic, 'task' => 'a.b']]);
+        }
+    }
+
+    public function testExternalPublishTriggersSubscribersInOneCorrelationChain(): void
+    {
+        $listener = new ScriptedAgent('listener', ['work.follow']);
+        $orchestrator = $this->orchestrator([[$listener, [['topic' => 'deploy.done', 'task' => 'work.follow']]]]);
+
+        $outcomes = $orchestrator->publish('deploy.done', ['release' => 'r1']);
+        $this->assertSame(['listener'], array_map(static fn ($o) => $o->agentId, $outcomes));
+        $published = $this->message('deploy.done');
+        $this->assertSame(Orchestrator::EXTERNAL, $published->source);
+        $this->assertSame(['release' => 'r1'], $listener->received[0]->payload);
+        $this->assertSame($published->correlationId, $listener->received[0]->correlationId);
+        $this->assertSame($published->id, $listener->received[0]->causationId);
+        $this->assertSame(1, $listener->received[0]->hop);
+
+        $this->assertSame([], $orchestrator->publish('nobody.listens', []), 'an unsubscribed topic runs nothing');
+        $this->assertSame('nobody.listens', $this->topics()[count($this->topics()) - 1], 'but is still journaled');
+        $this->assertThrows(\Workspace\Agents\Kernel\ProtocolException::class, fn () => $orchestrator->publish('Bad_Topic', []));
     }
 
     public function testRegistryLoadsTheShippedAgentsJson(): void
     {
         $registry = AgentRegistry::fromFile(dirname(__DIR__, 2).'/agents.json');
-        $this->assertSame(['dependency-deployment'], array_keys($registry->all()));
-        $this->assertSame([['agent' => 'dependency-deployment', 'topic' => 'release.requested', 'task' => 'deployment.readiness']], $registry->subscriptions());
+        $this->assertSame(['dependency-deployment', 'sentinel-verifier'], array_keys($registry->all()));
+        $this->assertSame([
+            ['agent' => 'dependency-deployment', 'topic' => 'release.requested', 'task' => 'deployment.readiness'],
+            ['agent' => 'sentinel-verifier', 'topic' => 'deployment.completed', 'task' => 'sentinel.verify'],
+            ['agent' => 'sentinel-verifier', 'topic' => 'sentinel.audit-requested', 'task' => 'sentinel.verify'],
+        ], $registry->subscriptions());
     }
 
     /** @param list<array{0: Agent, 1: list<array>}> $agents */
