@@ -1,0 +1,23 @@
+{
+    "entries": {
+        ".deployment/release-manifest.json": {
+            "size": 115,
+            "sha256": "5fbc2e6e01b65c1eaefa9b9bbb741326b92493498b62f92a57bdf8bc96ddcb40"
+        },
+        "app/Http/Kernel.php": {
+            "size": 16,
+            "sha256": "b203fbd1824111b5f641601280be69a8958de7e30529b16c14618e73ca604028"
+        },
+        "composer.json": {
+            "size": 21,
+            "sha256": "1316d3a5db1302e75e56c6ff0a71fc70025cab2df5ad88ee83943df7232ed0a0"
+        },
+        "public/index.php": {
+            "size": 17,
+            "sha256": "db28e0750bdb4bf54f1458e8b5d9359db9963be65493b9cce66e0e16d57e67fd"
+        }
+    },
+    "format": "deployment-system-file-manifest",
+    "version": 1,
+    "manifest_hash": "ac725f4a7092950a6258d5991e7e609cb388bf5a8726fd127868a64e75b937fc"
+}

@@ -194,7 +194,7 @@ over the canonical (key-sorted, compact) JSON of the envelope without its
 | `sentinel.verify` | task | sentinel-verifier | see [Sentinel Verifier](#sentinel-verifier-sentinel-verifier) |
 | `deployment.completed` | topic (subscribed) | → `sentinel.verify` | same as the task payload |
 | `sentinel.audit-requested` | topic (subscribed) | → `sentinel.verify` | same as the task payload |
-| `sentinel.verification.passed` / `.failed` | topics | sentinel-verifier | `project_key`, `environment`, `release_id`, `commit_sha`, `deployment_id`, `status`, `sentinel_verdict`, `verdict`, `evidence_hash`, `snapshot_hash`, `non_conformant_files`, `reasons` |
+| `sentinel.verification.passed` / `.failed` | topics | sentinel-verifier | `project_key`, `environment`, `release_id`, `commit_sha`, `deployment_id`, `status`, `sentinel_verdict`, `verdict`, `evidence_hash`, `snapshot_hash`, `non_conformant_files`, `reasons`, `reaudit_of` |
 | `task.*`, `artifact.created` | topics | orchestrator | see lifecycle table |
 
 ## Dependency & Deployment Agent (`dependency-deployment`)
@@ -304,6 +304,22 @@ root or absolute, `.json` only, at most 16 MiB):
 At least one of `evidence`/`snapshot` is required (`EVIDENCE_MISSING`
 otherwise). A malformed request is `BLOCKED` and emits no verification event.
 
+**Manual run** (empty payload on a task not derived from an event, e.g. the
+dashboard's Run button): the agent re-audits the evidence sealed into the
+newest intact `sentinel` artifact — its `evidence.json` /
+`runtime-snapshot.json` and the `expectation` that audit recorded. Artifacts
+whose envelope or attachment digests no longer verify, or that another agent
+produced, are skipped (at most the newest 50 are inspected), and the bytes
+read must still equal the sealed digests (`INPUT_CHANGED` otherwise). File
+comparison is not repeated. The report, event and `data` carry `reaudit_of`,
+the summary starts `Re-audit of <artifact_id>:` and an info
+`SENTINEL_REAUDIT` finding says it is not an audit of a new deployment. With
+no intact artifact the task passes with `data.status` `NO_EVIDENCE`, verdict
+`ATTENTION`, one `SENTINEL_NO_EVIDENCE` warning whose remedy says how to
+supply evidence, and no artifact or verification event. An event — such as
+`deployment.completed` — that arrives without evidence is still
+`EVIDENCE_MISSING`, never answered from an older seal.
+
 **Checks**, in four sections, each `pass` / `fail` / `unknown`:
 
 - `evidence.*` — exactly the Hub verifier's checks (commit, artifact checksum,
@@ -356,10 +372,13 @@ registration because no message could ever carry it.
 **Local test.**
 
 ```powershell
-# 1. Fail closed without evidence (exit 2, EVIDENCE_MISSING)
+# 1. Manual run: re-audit the newest intact seal, or NO_EVIDENCE (ATTENTION) without one
 php agents/bin/agent run sentinel.verify --target=sentinel-verifier
 
-# 2. A real audit: task file with payload paths (see the table above)
+# 2. A real audit: task file with payload paths (see the table above).
+#    tests/Support/SentinelFixture/ is one coherent static deployment (VERIFIED);
+#    its payload paths are workspace-relative, so run it from the agents folder:
+#    php bin/agent run sentinel.verify --target=sentinel-verifier --payload-file=tests/Support/SentinelFixture/valid-payload.json
 php agents/bin/agent run sentinel.verify --target=sentinel-verifier --payload-file=audit.json --verbose
 
 # 3. As the deployment pipeline would trigger it

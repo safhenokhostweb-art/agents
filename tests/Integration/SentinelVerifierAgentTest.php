@@ -263,6 +263,54 @@ final class SentinelVerifierAgentTest extends TestCase
         }
     }
 
+    public function testManualRunWithoutPayloadReauditsTheNewestIntactSealedEvidence(): void
+    {
+        $sealed = $this->run($this->fixture->payload());
+        $sealedId = $sealed->artifacts[0]['artifact_id'];
+
+        $outcome = $this->run([]);
+        $this->assertSame(Status::Pass, $outcome->result->status);
+        $this->assertSame('VERIFIED', $outcome->result->data['sentinel_verdict'], 'the sealed expectation travels with the sealed evidence');
+        $this->assertSame($sealedId, $outcome->result->data['reaudit_of']);
+        $this->assertStringContains("Re-audit of {$sealedId}: PASSED", $outcome->result->summary);
+        $this->assertSame('SENTINEL_REAUDIT', $this->finding($outcome, $sealedId)['code']);
+
+        $report = $this->report($outcome);
+        $this->assertSame($sealedId, $report['reaudit_of']);
+        $this->assertSame(['evidence', 'snapshot', 'agreement'], array_keys($report['sections']), 'file comparison is not repeated from a seal');
+        $this->assertSame($this->report($sealed)['evidence_hash']['evidence'], $report['evidence_hash']['evidence'], 'the very same evidence was re-verified');
+        $this->assertStringContains("var/artifacts/sentinel/{$sealedId}/evidence.json", $this->envelope($outcome)['provenance']['inputs']['evidence']['path']);
+        $this->assertSame($sealedId, $this->fixture->bus->history()[count($this->fixture->bus->history()) - 2]->payload['reaudit_of']);
+    }
+
+    public function testManualRunSkipsATamperedSealAndReportsNoEvidenceInsteadOfBlocking(): void
+    {
+        $sealed = $this->run($this->fixture->payload());
+        file_put_contents(dirname($sealed->artifacts[0]['path']).'/evidence.json', "{}\n");
+        $before = count($this->fixture->bus->history());
+
+        $outcome = $this->run([]);
+        $this->assertSame(Status::Pass, $outcome->result->status, 'nothing to audit is guidance, not a blocked task');
+        $this->assertSame('NO_EVIDENCE', $outcome->result->data['status']);
+        $this->assertSame('ATTENTION', $outcome->result->data['verdict']);
+        $this->assertSame('UNKNOWN', $outcome->result->data['sentinel_verdict']);
+        $this->assertSame(['SENTINEL_NO_EVIDENCE'], $this->codes($outcome, 'warning'));
+        $this->assertSame(1, $outcome->result->findings[0]->evidence['skipped_artifacts'], 'the tampered seal was skipped, never trusted');
+        $this->assertStringContains('--payload-file', (string) $outcome->result->findings[0]->remedy);
+        $this->assertSame([], $outcome->artifacts);
+        $this->assertSame(['task.started', 'task.completed'], array_map(static fn ($m): string => $m->topic, array_slice($this->fixture->bus->history(), $before)), 'no verification event without a verdict');
+    }
+
+    public function testAnEventWithoutEvidenceIsStillBlockedRatherThanAnsweredFromAnOlderSeal(): void
+    {
+        $this->run($this->fixture->payload());
+        $outcomes = $this->fixture->orchestrator()->publish(SentinelVerifierAgent::TOPIC_DEPLOYMENT_COMPLETED, []);
+
+        $this->assertSame(Status::Blocked, $outcomes[0]->result->status);
+        $this->assertSame('EVIDENCE_MISSING', $outcomes[0]->result->findings[0]->code);
+        $this->assertSame([], $outcomes[0]->artifacts);
+    }
+
     public function testRegistryDeclaresWhatTheAgentProducesForTheDashboard(): void
     {
         $entry = array_values(array_filter(Json::decodeFile(dirname(__DIR__, 2).'/agents.json')['agents'], static fn (array $a): bool => $a['id'] === SentinelVerifierAgent::ID))[0];

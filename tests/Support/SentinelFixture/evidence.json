@@ -1,0 +1,34 @@
+{
+    "evidence_version": "sentinel.v1",
+    "project_key": "customer-site",
+    "environment": "production",
+    "expected_commit_sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+    "observed_commit_sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+    "artifact_id": "art-0001",
+    "artifact_checksum_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "observed_artifact_checksum_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "release_id": "rel-0001",
+    "observed_release_id": "rel-0001",
+    "agent_id": "agent-0001",
+    "agent_version": "1.4.3",
+    "runtime_release_path": "releases/dep-0001",
+    "expected_runtime_marker": "release:dep-0001|commit:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+    "runtime_marker": "release:dep-0001|commit:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+    "health_endpoint": "https://site.example.com/health",
+    "expected_health_status": 200,
+    "health_status": 200,
+    "checks": {
+        "release_available": {
+            "status": "pass",
+            "detail": "expected release resolved from authoritative records."
+        },
+        "freshness": {
+            "status": "pass",
+            "detail": "runtime observation is fresh (12s old)."
+        }
+    },
+    "verified_at": "2026-10-28T16:09:29+00:00",
+    "result": null,
+    "expected_file_manifest_hash": "ac725f4a7092950a6258d5991e7e609cb388bf5a8726fd127868a64e75b937fc",
+    "observed_file_manifest_hash": "ac725f4a7092950a6258d5991e7e609cb388bf5a8726fd127868a64e75b937fc"
+}

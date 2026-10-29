@@ -9,10 +9,12 @@ use InvalidArgumentException;
 use Workspace\Agents\Kernel\AbstractAgent;
 use Workspace\Agents\Kernel\AgentContext;
 use Workspace\Agents\Kernel\Artifact;
+use Workspace\Agents\Kernel\ArtifactStore;
 use Workspace\Agents\Kernel\Finding;
 use Workspace\Agents\Kernel\ProtocolException;
 use Workspace\Agents\Kernel\Result;
 use Workspace\Agents\Kernel\Task;
+use Workspace\Agents\Support\Json;
 use Workspace\Agents\Support\Paths;
 
 /**
@@ -36,6 +38,10 @@ use Workspace\Agents\Support\Paths;
  * database, calls a runtime or health endpoint, follows a link out of a
  * release, or writes anywhere but its own artifact. Missing or
  * uninterpretable evidence is UNKNOWN, never VERIFIED.
+ *
+ * A manual run (empty payload, not derived from an event) re-audits the
+ * evidence sealed into the newest intact sentinel artifact instead; with
+ * none, it reports SENTINEL_NO_EVIDENCE (ATTENTION) rather than blocking.
  */
 final class SentinelVerifierAgent extends AbstractAgent
 {
@@ -52,6 +58,10 @@ final class SentinelVerifierAgent extends AbstractAgent
     /** The binary audit status: PASSED only when VERIFIED; UNKNOWN fails closed. */
     public const STATUS_PASSED = 'PASSED';
     public const STATUS_FAILED = 'FAILED';
+    /** A manual run found nothing to audit; not a verdict on any deployment. */
+    public const STATUS_NO_EVIDENCE = 'NO_EVIDENCE';
+    /** Newest sentinel artifacts a manual re-audit inspects before giving up. */
+    public const REAUDIT_SCAN_LIMIT = 50;
 
     /** The Hub's default deployment.runtime_snapshot_freshness_seconds. */
     public const DEFAULT_MAX_SNAPSHOT_AGE = 300;
@@ -93,6 +103,17 @@ final class SentinelVerifierAgent extends AbstractAgent
     protected function perform(Task $task, AgentContext $context): Result
     {
         $payload = $task->payload;
+        // Only a manual run may fall back to sealed evidence: an event that
+        // arrives without evidence must not be answered with an older
+        // deployment's verdict.
+        $reaudit = null;
+        if ($payload === [] && $task->hop === 0) {
+            $reaudit = $this->latestSealedAudit($context);
+            if (! isset($reaudit['payload'])) {
+                return $this->noEvidence($reaudit['skipped'] ?? 0);
+            }
+            $payload = $reaudit['payload'];
+        }
         $options = $this->options($payload);
         $expectation = $this->expectation($payload);
         $inputs = [];
@@ -147,6 +168,13 @@ final class SentinelVerifierAgent extends AbstractAgent
             }
         }
 
+        // The seal was verified before reading; the bytes read must still be the sealed ones.
+        foreach (['evidence' => 'evidence.json', 'snapshot' => 'runtime-snapshot.json'] as $key => $name) {
+            if ($reaudit !== null && isset($inputs[$key]) && ! hash_equals($reaudit['digests'][$name], $inputs[$key]['sha256'])) {
+                throw new ProtocolException('INPUT_CHANGED', "{$name} of {$reaudit['artifact_id']} changed after its seal was verified.");
+            }
+        }
+
         $files = null;
         if (isset($payload['expected_manifest'])) {
             [$sections['files'], $files] = $this->files($context, $payload, $options, $evidence, $snapshot, $inputs);
@@ -167,12 +195,21 @@ final class SentinelVerifierAgent extends AbstractAgent
         if ($sentinelVerdict === Checks::VERIFIED) {
             $findings[] = Finding::info('SENTINEL_VERIFIED', 'Every evaluated link of the deployment proof chain holds.', $target['release_id'] ?? null, $hashes);
         }
+        if ($reaudit !== null) {
+            $findings[] = Finding::info(
+                'SENTINEL_REAUDIT',
+                "Manual run: re-audited the evidence sealed in {$reaudit['artifact_id']}; this is not an audit of a new deployment.",
+                $reaudit['artifact_id'],
+                ['artifact' => $reaudit['path'], 'skipped_artifacts' => $reaudit['skipped']],
+            );
+        }
 
         $report = [
             'schema' => self::REPORT_SCHEMA,
             'status' => $status,
             'sentinel_verdict' => $sentinelVerdict,
             'verdict' => $verdict,
+            'reaudit_of' => $reaudit['artifact_id'] ?? null,
             'checked_at' => gmdate('c'),
             'reference_time' => $reference->format(DATE_ATOM),
             'target' => $target,
@@ -200,6 +237,7 @@ final class SentinelVerifierAgent extends AbstractAgent
                 'workspace_root' => $context->workspaceRoot,
                 'inputs' => $inputs,
                 'options' => $options,
+                'reaudit_of' => $reaudit['artifact_id'] ?? null,
             ],
             $attachments,
             self::ARTIFACT_NAME,
@@ -215,11 +253,13 @@ final class SentinelVerifierAgent extends AbstractAgent
                 'snapshot_hash' => $hashes['snapshot'],
                 'non_conformant_files' => count($nonConformant),
                 'reasons' => $reasons,
+                'reaudit_of' => $reaudit['artifact_id'] ?? null,
             ],
         ];
 
         $summary = sprintf(
-            '%s (%s): %d failed and %d unknown check(s)%s%s',
+            '%s%s (%s): %d failed and %d unknown check(s)%s%s',
+            $reaudit === null ? '' : "Re-audit of {$reaudit['artifact_id']}: ",
             $status,
             $sentinelVerdict,
             $counts['fail'],
@@ -234,7 +274,90 @@ final class SentinelVerifierAgent extends AbstractAgent
             'sentinel_verdict' => $sentinelVerdict,
             'evidence_hash' => $hashes['evidence'],
             'non_conformant_files' => count($nonConformant),
+            'reaudit_of' => $reaudit['artifact_id'] ?? null,
         ]);
+    }
+
+    /**
+     * The newest sentinel artifact that is still intact (envelope and
+     * attachment digests verify), was produced by this agent and seals
+     * evidence: the payload re-auditing it is its evidence.json /
+     * runtime-snapshot.json and the expectation that audit was asked to
+     * prove. File comparison is not repeated, since the release and
+     * manifests it read are not sealed. Tampered or foreign artifacts are
+     * skipped, never trusted.
+     *
+     * @return array{artifact_id?: string, path?: string, payload?: array<string, string>, digests?: array<string, ?string>, skipped: int}
+     */
+    private function latestSealedAudit(AgentContext $context): array
+    {
+        $settings = (array) $context->setting('runtime', []);
+        $root = $context->path((string) ($settings['artifacts'] ?? 'agents/var/artifacts')).'/'.self::ARTIFACT_KIND;
+        $candidates = [];
+        foreach (is_dir($root) ? (scandir($root) ?: []) : [] as $entry) {
+            // Ids end in -<UTC timestamp>-<random>; the name before them changed (sentinel- → audit-).
+            if (preg_match('/-(\d{8}T\d{6})-[0-9a-f]{8}$/D', $entry, $match) === 1 && is_file("{$root}/{$entry}/artifact.json")) {
+                $candidates[] = [$match[1], $entry];
+            }
+        }
+        rsort($candidates);
+
+        $skipped = 0;
+        foreach (array_slice($candidates, 0, self::REAUDIT_SCAN_LIMIT) as [, $entry]) {
+            $path = "{$root}/{$entry}/artifact.json";
+            if (! ArtifactStore::verify($path)['valid']) {
+                $skipped++;
+                continue;
+            }
+            $envelope = Json::decodeFile($path);
+            $attachments = (array) ($envelope['attachments'] ?? []);
+            if (($envelope['producer']['agent'] ?? null) !== self::ID || ($envelope['kind'] ?? null) !== self::ARTIFACT_KIND
+                || (! isset($attachments['evidence.json']) && ! isset($attachments['runtime-snapshot.json']))) {
+                $skipped++;
+                continue;
+            }
+            $directory = $this->display($context, "{$root}/{$entry}");
+            $expectation = array_intersect_key((array) ($envelope['payload']['expectation'] ?? []), array_flip(EvidenceVerifier::EXPECTATION_KEYS));
+            $payload = array_filter($expectation, static fn (mixed $value): bool => is_string($value));
+            foreach (['evidence' => 'evidence.json', 'snapshot' => 'runtime-snapshot.json'] as $key => $name) {
+                if (isset($attachments[$name])) {
+                    $payload[$key] = "{$directory}/{$name}";
+                }
+            }
+
+            return [
+                'artifact_id' => (string) $envelope['artifact_id'],
+                'path' => $this->display($context, $path),
+                'payload' => $payload,
+                'digests' => ['evidence.json' => $attachments['evidence.json']['sha256'] ?? null, 'runtime-snapshot.json' => $attachments['runtime-snapshot.json']['sha256'] ?? null],
+                'skipped' => $skipped,
+            ];
+        }
+
+        return ['skipped' => $skipped];
+    }
+
+    /** A manual run with nothing to audit: guidance, not a verdict, so no artifact and no verification event. */
+    private function noEvidence(int $skipped): Result
+    {
+        return Result::pass(
+            'NO_EVIDENCE: no intact sentinel artifact to re-audit; nothing was verified.',
+            [Finding::warning(
+                'SENTINEL_NO_EVIDENCE',
+                'Manual run without a payload found no intact sentinel artifact under var/artifacts/sentinel'.($skipped > 0 ? " ({$skipped} skipped as tampered or foreign)" : '').'; no deployment was verified.',
+                null,
+                ['skipped_artifacts' => $skipped],
+                'Deploy through deployment-system so deployment.completed delivers sentinel.v1 evidence, or run `bin/agent run sentinel.verify --target=sentinel-verifier --payload-file=<payload.json>` naming payload.evidence and/or payload.snapshot.',
+            )],
+            data: [
+                'status' => self::STATUS_NO_EVIDENCE,
+                'verdict' => 'ATTENTION',
+                'sentinel_verdict' => Checks::INDETERMINATE,
+                'evidence_hash' => null,
+                'non_conformant_files' => 0,
+                'reaudit_of' => null,
+            ],
+        );
     }
 
     /**

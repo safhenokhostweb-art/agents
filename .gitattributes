@@ -1,0 +1,3 @@
+# The static sentinel fixture is hash-sealed (file manifest, evidence and
+# snapshot digests); line-ending conversion on checkout would break it.
+tests/Support/SentinelFixture/** -text

@@ -1,0 +1,13 @@
+{
+    "evidence": "agents/tests/Support/SentinelFixture/evidence.json",
+    "snapshot": "agents/tests/Support/SentinelFixture/snapshot.json",
+    "expected_manifest": "agents/tests/Support/SentinelFixture/expected-manifest.json",
+    "release_dir": "agents/tests/Support/SentinelFixture/release",
+    "project_key": "customer-site",
+    "environment": "production",
+    "release_id": "rel-0001",
+    "deployment_id": "dep-0001",
+    "commit_sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+    "artifact_checksum_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "agent_id": "agent-0001"
+}

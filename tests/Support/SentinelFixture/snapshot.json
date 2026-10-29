@@ -1,0 +1,20 @@
+{
+    "evidence_version": "sentinel.runtime.v1",
+    "agent_id": "agent-0001",
+    "agent_version": "1.4.3",
+    "project_key": "customer-site",
+    "environment": "production",
+    "release_id": "rel-0001",
+    "deployment_id": "dep-0001",
+    "current_release_path": "releases/dep-0001",
+    "runtime_marker": "release:dep-0001|commit:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+    "release_manifest_commit_sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+    "timestamp": "2026-10-28T16:09:17+00:00",
+    "sequence": 1761600000,
+    "nonce": "bccc4009f78b7c88e29c1da03968bd19",
+    "snapshot_status": "complete",
+    "file_manifest_hash": "ac725f4a7092950a6258d5991e7e609cb388bf5a8726fd127868a64e75b937fc",
+    "file_manifest_entry_count": 4,
+    "file_manifest_total_size": 169,
+    "file_observation_status": "verified"
+}
