@@ -41,16 +41,16 @@
         "schema": "agent-dashboard.layout/v1",
         "positions": {
             "dependency-deployment": {
-                "x": 49,
-                "y": 28
+                "x": 34,
+                "y": 30
             },
             "release-preparer": {
-                "x": 598,
-                "y": 228
+                "x": 380,
+                "y": 210
             },
             "sentinel-verifier": {
-                "x": 42,
-                "y": 293
+                "x": 719,
+                "y": 37
             }
         },
         "edges": [
@@ -60,9 +60,9 @@
                 "label": null
             },
             {
-                "source": "sentinel-verifier",
-                "target": "release-preparer",
-                "label": null
+                "source": "release-preparer",
+                "target": "sentinel-verifier",
+                "label": "deployment.completed"
             }
         ]
     }
