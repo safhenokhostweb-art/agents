@@ -1,0 +1,152 @@
+{
+    "schema": "agents.disk-janitor/v1",
+    "reports": "deployment-system/service/storage/logs/janitor-reports",
+    "limits": {
+        "max_entries": 500000,
+        "max_candidates": 20000,
+        "max_depth": 12
+    },
+    "protect": {
+        "names": {
+            "environment": [".env", ".env.*", "*.env", "*.env.*"],
+            "database": ["*.sqlite", "*.sqlite3", "*.sqlite-wal", "*.sqlite-shm", "*.sqlite-journal", "*.db", "*.db3", "*.db-wal", "*.db-shm", "*.ibd", "*.frm", "*.myd", "*.myi", "ibdata*", "*.rdb", "*.aof"],
+            "secret": ["*.pem", "*.key", "*.p12", "*.pfx", "*.kdbx", "id_rsa*", "id_ed25519*", "id_ecdsa*", "auth.json", ".htpasswd", "*secret*", "*credential*"],
+            "placeholder": [".gitignore", ".gitkeep", ".gitattributes"]
+        },
+        "segments": [".git", ".svn", ".hg", ".ssh", ".gnupg"],
+        "paths": {
+            "media": ["**/storage/app/public/**", "**/public/storage/**", "**/public/uploads/**", "**/storage/uploads/**", "**/uploads/**", "**/media/**"]
+        },
+        "roots": ["/var/lib/mysql", "/var/lib/postgresql", "/var/lib/redis", "/etc/letsencrypt", "/root/.ssh"]
+    },
+    "projects": {
+        "extra_roots": ["agents"],
+        "disposable": [
+            "storage/logs/**",
+            "storage/framework/sessions/**",
+            "storage/framework/cache/**",
+            "storage/app/tmp/**",
+            "storage/app/backups/*.sql",
+            "storage/app/backups/*.sql.gz",
+            "storage/backups/*.sql",
+            "storage/backups/*.sql.gz",
+            "service/storage/logs/**",
+            "service/storage/framework/sessions/**",
+            "service/storage/framework/cache/**",
+            "service/storage/app/tmp/**",
+            "service.backup-*",
+            "service.backup-*/**",
+            "service.failed-*",
+            "service.failed-*/**"
+        ]
+    },
+    "rules": [
+        {
+            "id": "laravel-logs",
+            "kind": "files",
+            "reason": "Laravel log not written for 14 days (daily, rotated or compressed)",
+            "roots": ["*/storage/logs", "*/service/storage/logs"],
+            "skip_roots": ["**.backup-*/**", "**.failed-*/**"],
+            "match": ["**.log", "**.log.*"],
+            "exclude": ["janitor-reports/**"],
+            "min_age_days": 14
+        },
+        {
+            "id": "nginx-logs",
+            "kind": "files",
+            "reason": "Rotated or compressed Nginx log older than 14 days",
+            "roots": ["/var/log/nginx", "/var/log/nginx-diagnostic"],
+            "match": ["**.log.*", "**.gz"],
+            "min_age_days": 14
+        },
+        {
+            "id": "system-logs",
+            "kind": "files",
+            "reason": "Rotated or compressed system log older than 14 days",
+            "roots": ["/var/log"],
+            "match": ["**.gz", "**.0", "**.1", "**.old"],
+            "exclude": ["journal/**", "installer/**"],
+            "min_age_days": 14
+        },
+        {
+            "id": "laravel-temp",
+            "kind": "files",
+            "reason": "Temporary upload or processing file left in storage/app/tmp for over a day",
+            "roots": ["*/storage/app/tmp", "*/service/storage/app/tmp"],
+            "skip_roots": ["**.backup-*/**", "**.failed-*/**"],
+            "match": ["**"],
+            "min_age_days": 1
+        },
+        {
+            "id": "laravel-sessions",
+            "kind": "files",
+            "reason": "File session idle for over a day (SESSION_LIFETIME on this host is 120 minutes)",
+            "roots": ["*/storage/framework/sessions", "*/service/storage/framework/sessions"],
+            "skip_roots": ["**.backup-*/**", "**.failed-*/**"],
+            "match": ["*"],
+            "min_age_days": 1
+        },
+        {
+            "id": "laravel-cache",
+            "kind": "expired-cache",
+            "reason": "Laravel file-cache entry past its own expiry timestamp",
+            "roots": ["*/storage/framework/cache/data", "*/service/storage/framework/cache/data"],
+            "skip_roots": ["**.backup-*/**", "**.failed-*/**"],
+            "match": ["**"],
+            "min_age_days": 0
+        },
+        {
+            "id": "abandoned-tmp",
+            "kind": "entries",
+            "reason": "Abandoned temporary file or build directory in /tmp, untouched for 14 days",
+            "roots": ["/tmp"],
+            "match": ["*"],
+            "exclude": [".*", "systemd-private-*", "snap-private-tmp", "tmux-*", "php*", "mysql*", "pear"],
+            "min_age_days": 14
+        },
+        {
+            "id": "abandoned-root-builds",
+            "kind": "entries",
+            "reason": "Abandoned staging/bootstrap build directory in /root, untouched for 30 days",
+            "roots": ["/root"],
+            "match": ["deployment-agent-runtime-20*", "deployment-system-bootstrap-20*", "deployment-system-staging-20*"],
+            "min_age_days": 30
+        },
+        {
+            "id": "deploy-backups",
+            "kind": "entries",
+            "reason": "Deployment backup beyond retention (2 newest per project kept)",
+            "roots": ["."],
+            "match": ["*.backup-*"],
+            "retention": {
+                "group_pattern": "/^(?<group>.+)\\.backup-(?<stamp>\\d{8}-\\d{6})-[0-9a-f]+$/",
+                "keep_newest": 2
+            },
+            "min_age_days": 7
+        },
+        {
+            "id": "hub-service-backups",
+            "kind": "entries",
+            "reason": "Hub service backup or failed install beyond retention (newest per kind kept)",
+            "roots": ["deployment-system"],
+            "match": ["service.backup-*", "service.failed-*"],
+            "retention": {
+                "group_pattern": "/^(?<group>service\\.(?:backup|failed))-(?<stamp>\\d{8}[-T]\\d{6})/",
+                "keep_newest": 1
+            },
+            "min_age_days": 7
+        },
+        {
+            "id": "db-dump-backups",
+            "kind": "entries",
+            "reason": "Database dump beyond retention (7 newest per series kept)",
+            "roots": ["saas-platform/storage/app/backups", "customer-site/storage/backups"],
+            "match": ["*.sql", "*.sql.gz"],
+            "retention": {
+                "group_pattern": "/^(?<group>[a-z_]+?)_(?<stamp>\\d{4}-\\d{2}-\\d{2}_[0-9-]{6,8})\\.sql(?:\\.gz)?$/",
+                "keep_newest": 7
+            },
+            "min_age_days": 14
+        }
+    ]
+}

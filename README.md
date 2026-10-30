@@ -13,11 +13,12 @@ Zero dependencies: PHP 8.4 CLI and git. No `composer install` needed.
 agents/
   agents.json        registry: which agents exist, what they subscribe to
   workspace.json     topology: project paths/roles, deployment-system, runtime dirs
+  disk-janitor.json  Server Disk Janitor policy: disposable-file rules and the protection list
   bootstrap.php      PSR-4 autoloader (Workspace\Agents\ → src/, …\Tests\ → tests/)
   bin/agent          CLI
   src/Kernel/        the protocol (contracts, bus, orchestrator, artifact store)
   src/Support/       read-only helpers (git, composer, globbing, hashing, semver)
-  src/Agents/<Name>/ one directory per agent (DependencyDeployment, SentinelVerifier)
+  src/Agents/<Name>/ one directory per agent (DependencyDeployment, SentinelVerifier, ServerDiskJanitor)
   tests/             zero-dependency runner, unit + integration suites
   var/               runtime output (gitignored): artifacts/, bus/journal.jsonl
 ```
@@ -36,7 +37,9 @@ php agents/tests/run.php [filter]
 ```
 
 `run`/`dispatch`/`publish` accept `--json` (machine output), `--verbose` (show info
-findings) and `--strict`; `run` and `publish` take the payload inline
+findings), `--strict`, and `--dry-run` (sets payload `dry_run: true`, overriding
+the payload; agents that do not declare `dry_run` reject it as
+`INVALID_PAYLOAD`); `run` and `publish` take the payload inline
 (`--payload`) or from a JSON file (`--payload-file`, easier than quoting JSON
 in PowerShell). Exit codes: `0` PASS, `1` FAILED or runtime error,
 `2` BLOCKED, `3` PASS but a verdict other than `READY` (`--strict` only).
@@ -195,6 +198,10 @@ over the canonical (key-sorted, compact) JSON of the envelope without its
 | `deployment.completed` | topic (subscribed) | → `sentinel.verify` | same as the task payload |
 | `sentinel.audit-requested` | topic (subscribed) | → `sentinel.verify` | same as the task payload |
 | `sentinel.verification.passed` / `.failed` | topics | sentinel-verifier | `project_key`, `environment`, `release_id`, `commit_sha`, `deployment_id`, `status`, `sentinel_verdict`, `verdict`, `evidence_hash`, `snapshot_hash`, `non_conformant_files`, `reasons`, `reaudit_of` |
+| `disk.clean` | task | server-disk-janitor | `dry_run?: bool` (default `true`), `policy?: string`, `rules?: list` |
+| `maintenance.disk-clean-requested` | topic (subscribed) | → `disk.clean` | same as the task payload |
+| `deployment.completed` | topic (subscribed) | → `disk.clean` | foreign keys ignored, so always a dry-run audit |
+| `disk.cleanup.reported` | topic | server-disk-janitor | `run_id`, `dry_run`, `status`, `verdict`, `summary`, `report: {json, markdown}` |
 | `task.*`, `artifact.created` | topics | orchestrator | see lifecycle table |
 
 ## Dependency & Deployment Agent (`dependency-deployment`)
@@ -394,3 +401,123 @@ signature are checked at ingest and are not available offline, so a
 snapshot file is trusted only as far as its contents and its binding to the
 evidence. The deployment-system repository's Server Agent declares
 `AGENT_VERSION = '1.4.2'`; pass `min_agent_version` to require a newer one.
+
+## Server Disk Janitor (`server-disk-janitor`)
+
+Audits the host for disposable files and, only when asked explicitly,
+deletes them, recording every entry before it is removed.
+
+**Boundary.** This is the one agent that deletes, and the one that writes
+outside `var/`: an exception to principles 1 and 2 that the owner approved
+on 2026-10-31. The exception is bounded:
+
+- **Allowlist.** Only paths a rule in `disk-janitor.json` selects are
+  considered. Every rule states its reason, and no rule may scan `/`,
+  `/etc`, `/usr`, `/var/lib`, `/proc`, … (`POLICY_INVALID`).
+- **Protection list wins.** `ProtectionGuard` vetoes, by path only and
+  without opening the file: environment files (`.env`, `.env.*`, `*.env*`),
+  databases (`*.sqlite*`, `*.db`, InnoDB/MyISAM files, `*.rdb`), secrets
+  (`*.pem`, `*.key`, SSH keys, `auth.json`, `*secret*`, `*credential*`),
+  `.git`/`.ssh` path segments, files git tracks (if git cannot answer, the
+  whole work tree is protected), media (`storage/app/public`,
+  `public/storage`, `uploads`, `media`), and any file of a workspace
+  project outside its `projects.disposable` subtrees. A directory selected as
+  a whole (a *unit*) is skipped entirely if any file in it is protected, is
+  a link, sits on another filesystem, or could not be listed. It is never
+  emptied partially.
+- **Dry-run by default.** Deletion requires `"dry_run": false` in the
+  payload; `--dry-run` on the CLI forces a dry run whatever the payload
+  says. The canvas Run button sends an empty payload, so it only audits.
+- **Write-ahead audit trail.** Before the first deletion, the full plan
+  (every path, exact size, mtime/ctime and reason, outcome `pending`) is
+  written atomically to the report. If that write fails, the run is
+  `BLOCKED` and nothing is deleted.
+- **Stale plans are not trusted.** At deletion time each entry must still
+  have the planned inode, size and mtime and must not be a link. A unit
+  stops at the first file that is newer than planned or has become
+  protected. Such entries end as `changed` or `partial`, and nothing else
+  is retried.
+
+The walk never follows symlinks or junctions, never crosses filesystems,
+and stops at `limits` (`max_entries`, `max_candidates`, `max_depth`). On
+Windows a POSIX root such as `/tmp` is reported `missing` rather than
+resolved against `C:\`.
+
+**Rules** (`disk-janitor.json`; roots are workspace-relative or absolute and
+may contain `*`; ages are measured from mtime):
+
+| Rule | Kind | Selects |
+|---|---|---|
+| `laravel-logs` | files | `*.log` / `*.log.*` in every project's `storage/logs` not written for 14 days |
+| `nginx-logs` | files | rotated/compressed Nginx logs (`*.log.*`, `*.gz`) older than 14 days |
+| `system-logs` | files | rotated/compressed `/var/log` files (`*.gz`, `*.0`, `*.1`, `*.old`) older than 14 days; journald and installer logs excluded |
+| `laravel-temp` | files | `storage/app/tmp/**` older than 1 day |
+| `laravel-sessions` | files | file sessions idle for over 1 day (`SESSION_LIFETIME` on the host is 120 min) |
+| `laravel-cache` | expired-cache | file-cache entries whose own 10-digit expiry prefix has passed (`9999999999` = forever, kept) |
+| `abandoned-tmp` | entries | top-level `/tmp` files and directories untouched for 14 days (systemd, tmux, PHP, MySQL and hidden entries excluded) |
+| `abandoned-root-builds` | entries | `/root/deployment-agent-runtime-20*`, `deployment-system-bootstrap-20*`, `deployment-system-staging-20*` untouched for 30 days |
+| `deploy-backups` | entries | `/var/www/*.backup-*` beyond the 2 newest per project, older than 7 days |
+| `hub-service-backups` | entries | `deployment-system/service.{backup,failed}-*` beyond the newest of each, older than 7 days |
+| `db-dump-backups` | entries | `*.sql(.gz)` dumps beyond the 7 newest per series, older than 14 days |
+
+Kinds: `files` selects regular files below the root by relative glob;
+`expired-cache` also requires an expired Laravel cache prefix; `entries`
+selects top-level names of the root (directories as units, aged by their
+newest file), optionally with `retention` (`group_pattern` regex with
+`(?<group>…)` and optional `(?<stamp>…)` for ordering; `keep_newest ≥ 1`, so
+retention never deletes the newest copy). The first rule that selects a path
+owns it.
+
+Deployment backups hold a copy of the project's `.env` and media, so the
+protection list keeps them. The report lists them as protected
+(`PROTECTED_ENVIRONMENT (.env)`) with their size. Removing them is an owner
+decision outside this agent.
+
+**Reports.** `reports` in the policy:
+`deployment-system/service/storage/logs/janitor-reports/<YYYY-MM-DD>/<run_id>.{json,md}`,
+the Hub's Laravel `storage/logs` (on the server
+`/var/www/deployment-system/service/storage/logs/janitor-reports/`; the
+deployment-system root has no `storage/`). Only the report directory and its
+date folder are created: a missing parent is `REPORT_DIR_MISSING`. The JSON
+(`disk-janitor.report/v1`) has `status` (`dry-run` / `planned` /
+`completed`), `operator`, policy file and sha256, `summary`
+(`bytes_planned`, `bytes_freed`, `entries_*`, `files_*`, `bytes_protected`,
+`by_rule`), `roots` with scan status, `entries` (`path`, `type`, `bytes`,
+`files`, `modified_at`, `changed_at`, `created_at`, `rule`, `reason`,
+`outcome`, `error`), `protected` (with `protection`), and `retained`.
+`created_at` is the birth time on Windows. POSIX `stat()` has none, so it is
+`null` there and `changed_at` is the inode change time. The same report is
+sealed as `var/artifacts/disk-janitor/cleanup-<timestamp>-<random>/`
+(`report.json` attachment).
+
+**Findings.** `DISK_CLEANUP_PLANNED` / `DISK_CLEANUP_APPLIED`,
+`DISK_ENTRY_PROTECTED`, `DISK_ENTRY_CHANGED`, `DISK_ROOT_MISSING` (info);
+`DISK_CLEANUP_FAILED`, `DISK_ROOT_UNREADABLE`, `DISK_SCAN_LIMIT` (warning,
+so `ATTENTION`). Blocked: `POLICY_MISSING`, `POLICY_INVALID`,
+`INVALID_PAYLOAD`, `REPORT_DIR_MISSING`, `REPORT_UNWRITABLE`. Direct runs
+reject unknown payload keys; subscription-derived tasks ignore the event's
+foreign keys (`deployment.completed` carries Sentinel's payload), so they
+audit unless the event itself says `"dry_run": false`.
+
+**Running.**
+
+```bash
+php agents/bin/agent run disk.clean --verbose                         # dry run (default)
+php agents/bin/agent run disk.clean --payload='{"rules":["laravel-logs"]}' --dry-run
+php agents/bin/agent run disk.clean --payload='{"dry_run":false}'      # delete
+php agents/bin/agent publish maintenance.disk-clean-requested --payload='{"dry_run":false}'
+```
+
+Run it as a user that can read every root. The Hub canvas runs as
+`www-data`, which cannot list `/root`, and reports that as
+`DISK_ROOT_UNREADABLE`. For periodic cleaning, the owner can add a root
+crontab entry that publishes the maintenance topic. None is installed:
+
+```cron
+30 3 * * * cd /var/www/agents && php bin/agent publish maintenance.disk-clean-requested --payload='{"dry_run":false}' --json > /dev/null 2>&1
+```
+
+**Limits.** Ages are mtime-based. A process that keeps a deleted file open
+holds its space until it reopens the file, so live logs are excluded by age
+and only rotated system/Nginx logs are selected. Sizes are apparent bytes
+(`st_size`), not allocated blocks.

@@ -10,6 +10,9 @@
         "path": "deployment-system",
         "release_prepare": "deployment-system/deployment/release-prepare.php"
     },
+    "disk_janitor": {
+        "policy": "agents/disk-janitor.json"
+    },
     "runtime": {
         "artifacts": "agents/var/artifacts",
         "journal": "agents/var/bus/journal.jsonl"

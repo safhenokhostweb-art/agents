@@ -18,15 +18,17 @@ Workspace agent runtime
 
 Usage:
   php agents/bin/agent list
-  php agents/bin/agent run <task-type> [--payload='{"k":"v"}' | --payload-file=<file>] [--target=<agent-id>] [--json] [--strict] [--verbose]
-  php agents/bin/agent dispatch <task.json> [--json] [--strict] [--verbose]
-  php agents/bin/agent publish <topic> [--payload='{"k":"v"}' | --payload-file=<file>] [--json] [--strict] [--verbose]
+  php agents/bin/agent run <task-type> [--payload='{"k":"v"}' | --payload-file=<file>] [--target=<agent-id>] [--dry-run] [--json] [--strict] [--verbose]
+  php agents/bin/agent dispatch <task.json> [--dry-run] [--json] [--strict] [--verbose]
+  php agents/bin/agent publish <topic> [--payload='{"k":"v"}' | --payload-file=<file>] [--dry-run] [--json] [--strict] [--verbose]
   php agents/bin/agent verify <artifact.json>
   php agents/bin/agent journal [--correlation=<id>]
 
 Options:
   --workspace=<file>  workspace topology (default agents/workspace.json)
   --registry=<file>   agent registry (default agents/agents.json)
+  --dry-run           set payload dry_run=true, overriding the payload (agents that
+                      do not declare dry_run reject the task as INVALID_PAYLOAD)
 
 Exit codes: 0 PASS, 1 FAILED or error, 2 BLOCKED, 3 PASS but verdict not READY (--strict only)
 
@@ -63,9 +65,15 @@ try {
             if (! isset($positional[1])) {
                 throw new InvalidArgumentException('Missing '.($positional[0] === 'run' ? '<task-type>' : '<task.json>').'.');
             }
-            $task = $positional[0] === 'run'
-                ? Task::create($positional[1], payloadOption($options), isset($options['target']) ? (string) $options['target'] : null)
-                : Task::fromArray(Json::decodeFile($positional[1]));
+            if ($positional[0] === 'run') {
+                $task = Task::create($positional[1], payloadOption($options), isset($options['target']) ? (string) $options['target'] : null);
+            } else {
+                $data = Json::decodeFile($positional[1]);
+                if (isset($options['dry-run']) && is_array($data['payload'] ?? null)) {
+                    $data['payload']['dry_run'] = true;
+                }
+                $task = Task::fromArray($data);
+            }
             $runtime = Runtime::boot($workspaceFile, $registryFile);
             $outcomes = $runtime->orchestrator->dispatch($task);
             printOutcomes($outcomes, $options, $runtime->journalPath);
@@ -110,10 +118,16 @@ function payloadOption(array $options): array
         throw new InvalidArgumentException('Use either --payload or --payload-file, not both.');
     }
     if (isset($options['payload-file'])) {
-        return Json::decodeFile((string) $options['payload-file']);
+        $payload = Json::decodeFile((string) $options['payload-file']);
+    } else {
+        $payload = isset($options['payload']) ? Json::decode((string) $options['payload'], '--payload') : [];
+    }
+    // Wins over the payload, so a --dry-run run can never delete.
+    if (isset($options['dry-run'])) {
+        $payload['dry_run'] = true;
     }
 
-    return isset($options['payload']) ? Json::decode((string) $options['payload'], '--payload') : [];
+    return $payload;
 }
 
 /** @param list<Outcome> $outcomes */

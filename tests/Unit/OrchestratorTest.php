@@ -177,11 +177,13 @@ final class OrchestratorTest extends TestCase
     public function testRegistryLoadsTheShippedAgentsJson(): void
     {
         $registry = AgentRegistry::fromFile(dirname(__DIR__, 2).'/agents.json');
-        $this->assertSame(['dependency-deployment', 'sentinel-verifier'], array_keys($registry->all()));
+        $this->assertSame(['dependency-deployment', 'sentinel-verifier', 'server-disk-janitor'], array_keys($registry->all()));
         $this->assertSame([
             ['agent' => 'dependency-deployment', 'topic' => 'release.requested', 'task' => 'deployment.readiness'],
             ['agent' => 'sentinel-verifier', 'topic' => 'deployment.completed', 'task' => 'sentinel.verify'],
             ['agent' => 'sentinel-verifier', 'topic' => 'sentinel.audit-requested', 'task' => 'sentinel.verify'],
+            ['agent' => 'server-disk-janitor', 'topic' => 'maintenance.disk-clean-requested', 'task' => 'disk.clean'],
+            ['agent' => 'server-disk-janitor', 'topic' => 'deployment.completed', 'task' => 'disk.clean'],
         ], $registry->subscriptions());
     }
 
