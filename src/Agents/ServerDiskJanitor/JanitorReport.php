@@ -64,7 +64,65 @@ final class JanitorReport
     public function write(array $report): void
     {
         $this->atomic($this->jsonPath(), Json::encode($report).PHP_EOL);
-        $this->atomic($this->markdownPath(), self::markdown($report));
+        $this->atomic($this->markdownPath(), ($report['schema'] ?? null) === BackupArchiver::SCHEMA ? self::archiveMarkdown($report) : self::markdown($report));
+    }
+
+    public static function archiveMarkdown(array $report): string
+    {
+        $s = $report['summary'];
+        $lines = [
+            "# Backup archive report `{$report['run_id']}`",
+            '',
+            '| | |',
+            '|---|---|',
+            "| Status | `{$report['status']}` |",
+            '| Mode | '.($report['dry_run'] ? 'dry-run (nothing archived or deleted)' : 'apply').' |',
+            "| Started | {$report['started_at']} |",
+            '| Finished | '.($report['finished_at'] ?? '—').' |',
+            "| Pipeline | tar → {$report['pipeline']['compression']} → {$report['pipeline']['encryption']} |",
+            '| Recipients | '.($report['recipients'] === [] ? '—' : '`'.implode('`, `', $report['recipients']).'`').' |',
+            '| Remote | '.self::cell(implode(' ', array_map(static fn ($k, $v): string => "{$k}=".(is_bool($v) ? ($v ? 'true' : 'false') : (string) json_encode($v, JSON_UNESCAPED_SLASHES)), array_keys($report['remote']), $report['remote']))).' |',
+            "| Sources | {$s['sources_planned']} planned, {$s['verified']} verified off-site, {$s['deleted']} deleted, {$s['skipped']} skipped |",
+            '| Original size | '.self::bytes($s['original_bytes']).' |',
+            '| Compressed / encrypted | '.self::bytes($s['compressed_bytes']).' / '.self::bytes($s['encrypted_bytes']).' |',
+            '| Freed | '.self::bytes($s['bytes_freed']).' ('.number_format($s['bytes_freed']).' bytes) |',
+        ];
+        if ($report['error'] !== null) {
+            $lines[] = "| Error | step `{$report['error']['step']}`: ".self::cell($report['error']['message']).' |';
+        }
+        $lines[] = '';
+        $lines[] = '## Preflight';
+        $lines[] = '';
+        foreach ($report['preflight'] as $c) {
+            $lines[] = '- '.($c['status'] === 'pass' ? '✅' : '❌')." `{$c['check']}` — ".self::cell($c['detail']);
+        }
+        $lines[] = '';
+        $lines[] = '## Sources';
+        $lines[] = '';
+        if ($report['entries'] === []) {
+            $lines[] = '_None._';
+        } else {
+            $lines[] = '| Status | Path | Original | Compressed | Encrypted | SHA-256 | Remote verification | Freed |';
+            $lines[] = '|---|---|---:|---:|---:|---|---|---:|';
+            foreach ($report['entries'] as $e) {
+                $a = $e['archive'] ?? null;
+                $v = $e['remote']['verification'] ?? null;
+                $lines[] = "| {$e['status']} | `".self::cell($e['path']).'` | '.self::bytes($e['original_bytes']).' | '.($a ? self::bytes($a['compressed_bytes']) : '—').' | '.($a ? self::bytes($a['encrypted_bytes']) : '—').' | '.($a ? '`'.$a['sha256'].'`' : '—').' | '.($v ? ($v['verified'] ? "✅ {$v['method']}" : '❌ '.self::cell($v['reason'])) : '—').' | '.(isset($e['deletion']) ? self::bytes($e['deletion']['bytes_freed']) : '—').' |';
+                if (isset($e['error'])) {
+                    $lines[] = "| | ↳ failed at `{$e['error']['step']}`: ".self::cell($e['error']['message']).' | | | | | | |';
+                }
+            }
+        }
+        if ($report['skipped'] !== []) {
+            $lines[] = '';
+            $lines[] = '## Skipped (not safe to archive-and-delete)';
+            $lines[] = '';
+            foreach ($report['skipped'] as $e) {
+                $lines[] = '- `'.self::cell($e['path']).'` ('.self::bytes($e['original_bytes']).') — '.self::cell($e['problem']);
+            }
+        }
+
+        return implode("\n", $lines)."\n";
     }
 
     private function atomic(string $path, string $bytes): void

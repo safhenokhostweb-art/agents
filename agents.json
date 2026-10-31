@@ -48,15 +48,29 @@
                 {
                     "topic": "deployment.completed",
                     "task": "disk.clean"
+                },
+                {
+                    "topic": "maintenance.backup-archive-requested",
+                    "task": "backup.archive"
                 }
             ],
             "produces": {
                 "artifacts": [
-                    "disk-janitor"
+                    "disk-janitor",
+                    "backup-archive"
                 ],
                 "events": [
-                    "disk.cleanup.reported"
+                    "disk.cleanup.reported",
+                    "backup.archive.reported"
                 ]
+            },
+            "defaults": {
+                "disk.clean": {
+                    "dry_run": true
+                },
+                "backup.archive": {
+                    "dry_run": true
+                }
             }
         }
     ],
@@ -96,6 +110,12 @@
                 "target": "server-disk-janitor",
                 "label": "deployment.completed"
             }
-        ]
+        ],
+        "tasks": {
+            "server-disk-janitor": [
+                "disk.clean",
+                "backup.archive"
+            ]
+        }
     }
 }

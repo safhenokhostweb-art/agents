@@ -184,6 +184,7 @@ final class OrchestratorTest extends TestCase
             ['agent' => 'sentinel-verifier', 'topic' => 'sentinel.audit-requested', 'task' => 'sentinel.verify'],
             ['agent' => 'server-disk-janitor', 'topic' => 'maintenance.disk-clean-requested', 'task' => 'disk.clean'],
             ['agent' => 'server-disk-janitor', 'topic' => 'deployment.completed', 'task' => 'disk.clean'],
+            ['agent' => 'server-disk-janitor', 'topic' => 'maintenance.backup-archive-requested', 'task' => 'backup.archive'],
         ], $registry->subscriptions());
     }
 

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Workspace\Agents\Tests\Unit;
 
+use Workspace\Agents\Agents\ServerDiskJanitor\BackupArchiver;
 use Workspace\Agents\Agents\ServerDiskJanitor\DiskScanner;
 use Workspace\Agents\Agents\ServerDiskJanitor\JanitorPolicy;
 use Workspace\Agents\Agents\ServerDiskJanitor\JanitorReport;
@@ -49,12 +50,12 @@ final class ServerDiskJanitorTest extends TestCase
         $registry = AgentRegistry::fromFile($agents.'/agents.json');
         $this->assertSame(ServerDiskJanitorAgent::ID, $registry->get(ServerDiskJanitorAgent::ID)->id());
         $subscriptions = array_values(array_filter($registry->subscriptions(), static fn (array $s): bool => $s['agent'] === ServerDiskJanitorAgent::ID));
-        $this->assertSame([ServerDiskJanitorAgent::TOPIC_REQUESTED, 'deployment.completed'], array_column($subscriptions, 'topic'));
-        $this->assertSame([ServerDiskJanitorAgent::TASK], array_values(array_unique(array_column($subscriptions, 'task'))));
+        $this->assertSame([ServerDiskJanitorAgent::TOPIC_REQUESTED, 'deployment.completed', ServerDiskJanitorAgent::TOPIC_ARCHIVE_REQUESTED], array_column($subscriptions, 'topic'));
+        $this->assertSame([ServerDiskJanitorAgent::TASK, ServerDiskJanitorAgent::TASK, ServerDiskJanitorAgent::TASK_ARCHIVE], array_column($subscriptions, 'task'));
 
         $entry = array_column(Json::decodeFile($agents.'/agents.json')['agents'], null, 'id')[ServerDiskJanitorAgent::ID];
-        $this->assertSame([ServerDiskJanitorAgent::EVENT_REPORTED], $entry['produces']['events']);
-        $this->assertSame([ServerDiskJanitorAgent::ARTIFACT_KIND], $entry['produces']['artifacts']);
+        $this->assertSame([ServerDiskJanitorAgent::EVENT_REPORTED, BackupArchiver::EVENT_REPORTED], $entry['produces']['events']);
+        $this->assertSame([ServerDiskJanitorAgent::ARTIFACT_KIND, BackupArchiver::ARTIFACT_KIND], $entry['produces']['artifacts']);
     }
 
     public function testPolicyRefusesSystemRootsWeakRetentionAndUnexplainedRules(): void

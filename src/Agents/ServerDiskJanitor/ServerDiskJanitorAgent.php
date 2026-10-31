@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Workspace\Agents\Agents\ServerDiskJanitor;
 
+use Closure;
 use Workspace\Agents\Kernel\AbstractAgent;
 use Workspace\Agents\Kernel\AgentContext;
 use Workspace\Agents\Kernel\Artifact;
@@ -30,6 +31,10 @@ use Workspace\Agents\Support\Id;
  *    the first deletion; no report, no deletion;
  *  - dry-run is the default. Deletion needs `"dry_run": false`, and the
  *    CLI's --dry-run forces a dry run whatever the payload says.
+ *
+ * backup.archive (BackupArchiver) moves old backup directories off-site,
+ * encrypted to public keys, and deletes a local copy only after every
+ * archive of the run is verified at the destination.
  */
 final class ServerDiskJanitorAgent extends AbstractAgent
 {
@@ -40,12 +45,22 @@ final class ServerDiskJanitorAgent extends AbstractAgent
     public const ARTIFACT_KIND = 'disk-janitor';
     public const ARTIFACT_NAME = 'cleanup';
     public const DEFAULT_POLICY = 'agents/disk-janitor.json';
+    public const TASK_ARCHIVE = 'backup.archive';
+    public const TOPIC_ARCHIVE_REQUESTED = 'maintenance.backup-archive-requested';
 
-    /** Payload keys this agent reads. Direct runs reject any other key. */
-    private const SCHEMA = ['dry_run' => '?bool', 'policy' => '?string', 'rules' => '?list'];
+    /** Payload keys per task. Direct runs reject any other key. */
+    private const SCHEMA = [
+        self::TASK => ['dry_run' => '?bool', 'policy' => '?string', 'rules' => '?list'],
+        self::TASK_ARCHIVE => ['dry_run' => '?bool', 'policy' => '?string', 'sources' => '?list'],
+    ];
 
     /** Entries listed per finding; the report always has all of them. */
     private const FINDING_SAMPLE = 20;
+
+    /** @param Closure(ArchiveSettings): RemoteStore|null $storeFactory replaces the configured remote store (tests) */
+    public function __construct(private readonly ?Closure $storeFactory = null)
+    {
+    }
 
     public function id(): string
     {
@@ -54,7 +69,7 @@ final class ServerDiskJanitorAgent extends AbstractAgent
 
     public function handles(): array
     {
-        return [self::TASK];
+        return [self::TASK, self::TASK_ARCHIVE];
     }
 
     /**
@@ -73,6 +88,9 @@ final class ServerDiskJanitorAgent extends AbstractAgent
         $now = time();
         $policyFile = $options['policy'] ?? (string) ($context->setting('disk_janitor', [])['policy'] ?? self::DEFAULT_POLICY);
         $policy = JanitorPolicy::load($policyFile, $context);
+        if ($task->type === self::TASK_ARCHIVE) {
+            return (new BackupArchiver($policy, new ProtectionGuard($policy), $this->storeFactory, $now))->run($task, $options);
+        }
         if ($options['rules'] !== null && ($unknown = array_diff($options['rules'], $policy->ruleIds())) !== []) {
             throw new ProtocolException('INVALID_PAYLOAD', 'Unknown janitor rule(s): '.implode(', ', $unknown).'. Policy rules: '.implode(', ', $policy->ruleIds()));
         }
@@ -156,32 +174,37 @@ final class ServerDiskJanitorAgent extends AbstractAgent
         );
     }
 
-    /** @return array{dry_run: bool, policy: ?string, rules: ?list<string>} */
+    /** @return array{dry_run: bool, policy: ?string, rules?: ?list<string>, sources?: ?list<string>} */
     private function options(Task $task): array
     {
         $payload = $task->payload;
+        $schema = self::SCHEMA[$task->type];
         // A direct run is strict like every other agent; an event's foreign keys are not ours to judge.
         if ($task->causationId === null) {
             foreach (array_keys($payload) as $key) {
-                if (! array_key_exists($key, self::SCHEMA)) {
-                    throw new ProtocolException('INVALID_PAYLOAD', "Unknown payload key '{$key}' for ".self::TASK.'. Allowed: '.implode(', ', array_keys(self::SCHEMA)));
+                if (! array_key_exists($key, $schema)) {
+                    throw new ProtocolException('INVALID_PAYLOAD', "Unknown payload key '{$key}' for {$task->type}. Allowed: ".implode(', ', array_keys($schema)));
                 }
             }
         }
         $dryRun = $payload['dry_run'] ?? true;
         $policy = $payload['policy'] ?? null;
-        $rules = $payload['rules'] ?? null;
         if (! is_bool($dryRun)) {
             throw new ProtocolException('INVALID_PAYLOAD', "Payload key 'dry_run' must be of type bool.");
         }
         if ($policy !== null && (! is_string($policy) || $policy === '')) {
             throw new ProtocolException('INVALID_PAYLOAD', "Payload key 'policy' must be a non-empty string.");
         }
-        if ($rules !== null && (! is_array($rules) || ! array_is_list($rules) || array_filter($rules, 'is_string') !== $rules || $rules === [])) {
-            throw new ProtocolException('INVALID_PAYLOAD', "Payload key 'rules' must be a non-empty list of rule ids.");
+        $options = ['dry_run' => $dryRun, 'policy' => $policy];
+        // `rules` (disk.clean) or `sources` (backup.archive): an optional, non-empty list of policy ids.
+        $listKey = $task->type === self::TASK ? 'rules' : 'sources';
+        $list = $payload[$listKey] ?? null;
+        if ($list !== null && (! is_array($list) || ! array_is_list($list) || array_filter($list, 'is_string') !== $list || $list === [])) {
+            throw new ProtocolException('INVALID_PAYLOAD', "Payload key '{$listKey}' must be a non-empty list of ids.");
         }
+        $options[$listKey] = $list;
 
-        return ['dry_run' => $dryRun, 'policy' => $policy, 'rules' => $rules];
+        return $options;
     }
 
     /**

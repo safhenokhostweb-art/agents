@@ -1,0 +1,19 @@
+{
+    "encryption": {
+        "tool": "gpg",
+        "recipient_files": ["/etc/disk-janitor/backup-public-key.asc"]
+    },
+    "remote": {
+        "driver": "s3",
+        "endpoint": "https://s3.example-provider.com",
+        "region": "us-east-1",
+        "bucket": "server-backups",
+        "prefix": "production/",
+        "access_key": "REPLACE_ME",
+        "secret_key": "REPLACE_ME",
+        "path_style": true,
+        "checksum_header": true,
+        "timeout_seconds": 3600
+    },
+    "binaries": {}
+}

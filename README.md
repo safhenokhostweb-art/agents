@@ -13,7 +13,8 @@ Zero dependencies: PHP 8.4 CLI and git. No `composer install` needed.
 agents/
   agents.json        registry: which agents exist, what they subscribe to
   workspace.json     topology: project paths/roles, deployment-system, runtime dirs
-  disk-janitor.json  Server Disk Janitor policy: disposable-file rules and the protection list
+  disk-janitor.json  Server Disk Janitor policy: disposable-file rules, the protection list, backup.archive sources
+  disk-janitor.archive.example.json  template for the host-local backup.archive settings (key, remote store)
   bootstrap.php      PSR-4 autoloader (Workspace\Agents\ → src/, …\Tests\ → tests/)
   bin/agent          CLI
   src/Kernel/        the protocol (contracts, bus, orchestrator, artifact store)
@@ -202,6 +203,9 @@ over the canonical (key-sorted, compact) JSON of the envelope without its
 | `maintenance.disk-clean-requested` | topic (subscribed) | → `disk.clean` | same as the task payload |
 | `deployment.completed` | topic (subscribed) | → `disk.clean` | foreign keys ignored, so always a dry-run audit |
 | `disk.cleanup.reported` | topic | server-disk-janitor | `run_id`, `dry_run`, `status`, `verdict`, `summary`, `report: {json, markdown}` |
+| `backup.archive` | task | server-disk-janitor | `dry_run?: bool` (default `true`), `policy?: string`, `sources?: list` |
+| `maintenance.backup-archive-requested` | topic (subscribed) | → `backup.archive` | same as the task payload |
+| `backup.archive.reported` | topic | server-disk-janitor | `run_id`, `dry_run`, `status`, `verdict`, `summary`, `report: {json, markdown}` |
 | `task.*`, `artifact.created` | topics | orchestrator | see lifecycle table |
 
 ## Dependency & Deployment Agent (`dependency-deployment`)
@@ -521,3 +525,94 @@ crontab entry that publishes the maintenance topic. None is installed:
 holds its space until it reopens the file, so live logs are excluded by age
 and only rotated system/Nginx logs are selected. Sizes are apparent bytes
 (`st_size`), not allocated blocks.
+
+### Backup archive (`backup.archive`)
+
+Moves old backup directories off the server, encrypted at the source, and
+deletes the local copy only after the destination has proved it holds the
+exact bytes. The owner approved this on 2026-10-31. It deliberately removes
+directories that hold `.env` files and databases, which `disk.clean` never
+does, so the deletion is gated on an encrypted, verified off-site copy.
+
+**Sources** (`archive.sources` in `disk-janitor.json`, validated like
+`entries` rules): `deploy-backups`, which are `/var/www/{saas-platform,customer-site}.backup-*`
+older than 14 days, beyond the 2 newest per project (those stay local for
+rollback); and `bootstrap-dirs`, which are `/root/deployment-system-{bootstrap,staging}-20*`
+older than 14 days. A source is skipped, and reported, if its tree contains
+a `.git` directory (possibly an active repository), a mount point or an
+unreadable directory, or if `ProtectionGuard` protects the source directory
+itself.
+
+**Pipeline.**
+
+1. *Plan.* Each source gets a tree fingerprint: the lstat of every entry,
+   with links never followed.
+2. *Preflight*, with the same checks in a dry run and a real run:
+   - the settings are complete;
+   - `tar` and `gpg`/`age` (and `zstd`) are present;
+   - every recipient is a public key. A key file containing a private key is
+     refused, since a server able to decrypt its own backups is not
+     zero-knowledge;
+   - the remote store answers a probe for a non-existent object;
+   - staging has room for the largest source.
+
+   A real run with any failing check is `BLOCKED` (`ARCHIVE_PREFLIGHT_FAILED`)
+   and touches nothing.
+3. *Phase A*, for each source:
+   - re-check the fingerprint;
+   - stream `tar` → gzip (PHP zlib) or `zstd` → `gpg --recipient-file` / `age -R`
+     into staging. The plaintext tar never touches the disk, and gpg uses a
+     throwaway home, so the server keyring is never consulted;
+   - re-check the fingerprint (the tree must not change while it is read);
+   - compute the SHA-256 and MD5 of the encrypted file;
+   - refuse to overwrite an existing object, upload, then **handshake**.
+     The destination must report the same size and a digest *it computed*
+     that equals ours. That is the SHA-256 when it offers one: S3
+     `x-amz-checksum-sha256`, or a read-back for the filesystem driver.
+     Otherwise it is an MD5 ETag. No digest means the copy is unverified;
+   - upload and verify a `.manifest.json` the same way (source name, size,
+     tree fingerprint, recipients' fingerprints, archive SHA-256; no secrets).
+4. *Phase B*, only when **every** source passed phase A: delete each source,
+   provided its fingerprint still equals the archived one. Links are removed,
+   never followed.
+
+Any failure in phase A aborts the run before phase B, so nothing is deleted
+(`ARCHIVE_ABORTED`, verdict `BLOCKED`). Objects already uploaded stay at the
+destination under the run id. The staging directory is emptied on every
+outcome.
+
+**Settings** are host-local and never committed. The file is named by
+`archive.settings` (`/etc/disk-janitor/archive.json`, overridable with
+`JANITOR_ARCHIVE_SETTINGS`); start from `disk-janitor.archive.example.json`.
+Single keys can be overridden with `JANITOR_ARCHIVE_*` variables (see
+`ArchiveSettings::ENVIRONMENT`). A settings file holding `secret_key` must be
+mode `600`. Remote drivers:
+
+- `s3`: any SigV4 endpoint (AWS, MinIO, ArvanCloud, …), single streamed PUT
+  of up to 5 GiB (`max_archive_bytes`). The signed `x-amz-content-sha256`,
+  `Content-MD5` and `x-amz-checksum-sha256` make the server reject a body
+  that differs from what was hashed. Set `checksum_header: false` for a
+  provider that rejects the checksum header; verification then relies on the
+  MD5 ETag.
+- `filesystem`: a mounted off-site volume (NFS, sshfs, rclone). It writes to
+  a temp file then renames, and verifies by reading the stored copy back.
+
+**Report.** `janitor-reports/<date>/archive-<timestamp>-<random>.{json,md}`
+(`disk-janitor.archive-report/v1`), rewritten after every step. It holds the
+pipeline, the redacted settings and remote, the recipients' fingerprints, the
+preflight checks, and per source: `path`, `original_bytes`, `files`,
+`fingerprint`, `status` (`would-archive`, `archived`, `uploaded`, `verified`,
+`deleted`, `failed`, `not-started`), `archive` (key, compressed and encrypted
+bytes, `sha256`, `md5`), `remote` (location, transfer, `verification`),
+`manifest`, `deletion` (bytes freed) and `error` (`step`, `message`). It is
+sealed as `var/artifacts/backup-archive/archive-*/`.
+
+```bash
+php agents/bin/agent run backup.archive --target=server-disk-janitor --verbose          # dry run + preflight
+php agents/bin/agent run backup.archive --payload='{"dry_run":false,"sources":["bootstrap-dirs"]}'
+```
+
+Restore: download the object, then run
+`gpg --decrypt <object>.tar.gz.gpg | tar -xz` (or `zstd -d` for `.tar.zst.gpg`)
+on the machine that holds the private key, and compare the object's SHA-256
+with the manifest.

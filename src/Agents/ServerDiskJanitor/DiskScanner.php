@@ -86,8 +86,14 @@ final class DiskScanner
         ];
     }
 
+    /** @return list<array<string, mixed>> every root considered so far, with its scan status */
+    public function roots(): array
+    {
+        return $this->roots;
+    }
+
     /** @return list<string> existing, real, allowed root directories of a rule */
-    private function expandRoots(array $rule): array
+    public function expandRoots(array $rule): array
     {
         $roots = [];
         foreach ($rule['roots'] as $pattern) {
@@ -169,25 +175,7 @@ final class DiskScanner
         }
 
         // Retention first, by name, so the copies it keeps are never walked.
-        $retained = [];
-        if ($rule['retention'] !== null) {
-            $groups = [];
-            foreach ($items as $index => $item) {
-                if (preg_match($rule['retention']['group_pattern'], basename($item['path']), $m) !== 1) {
-                    unset($items[$index]);
-                    continue;
-                }
-                // Named `stamp` capture orders copies when present; modification time otherwise.
-                $groups[$m['group']][] = ['index' => $index, 'order' => isset($m['stamp']) && $m['stamp'] !== '' ? $m['stamp'] : sprintf('%020d', $item['stat']['mtime'])];
-            }
-            foreach ($groups as $group => $members) {
-                usort($members, static fn (array $a, array $b): int => strcmp($b['order'], $a['order']));
-                foreach (array_slice($members, 0, $rule['retention']['keep_newest']) as $keep) {
-                    $retained[] = ['rule' => $rule['id'], 'path' => $items[$keep['index']]['path'], 'group' => (string) $group];
-                    unset($items[$keep['index']]);
-                }
-            }
-        }
+        [$items, $retained] = self::retain($rule, $items);
 
         $selected = [];
         foreach ($items as ['path' => $path, 'stat' => $stat]) {
@@ -214,6 +202,38 @@ final class DiskScanner
         }
 
         return ['selected' => $selected, 'retained' => $retained];
+    }
+
+    /**
+     * Apply a rule's retention to top-level items (each with `path` and `stat`):
+     * names outside group_pattern are dropped, and the keep_newest copies of
+     * each group (by the `stamp` capture, else mtime) are set aside.
+     *
+     * @return array{0: list<array>, 1: list<array{rule: string, path: string, group: string}>}
+     */
+    public static function retain(array $rule, array $items): array
+    {
+        $retained = [];
+        if ($rule['retention'] === null) {
+            return [array_values($items), $retained];
+        }
+        $groups = [];
+        foreach ($items as $index => $item) {
+            if (preg_match($rule['retention']['group_pattern'], basename($item['path']), $m) !== 1) {
+                unset($items[$index]);
+                continue;
+            }
+            $groups[$m['group']][] = ['index' => $index, 'order' => isset($m['stamp']) && $m['stamp'] !== '' ? $m['stamp'] : sprintf('%020d', $item['stat']['mtime'])];
+        }
+        foreach ($groups as $group => $members) {
+            usort($members, static fn (array $a, array $b): int => strcmp($b['order'], $a['order']));
+            foreach (array_slice($members, 0, $rule['retention']['keep_newest']) as $keep) {
+                $retained[] = ['rule' => $rule['id'], 'path' => $items[$keep['index']]['path'], 'group' => (string) $group];
+                unset($items[$keep['index']]);
+            }
+        }
+
+        return [array_values($items), $retained];
     }
 
     /** @return array{bytes: int, files: int, newest: int, protection: ?string} */

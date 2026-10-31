@@ -46,6 +46,7 @@ final class JanitorPolicy
      * @param  array<string, list<string>>  $projects  absolute project root => disposable globs (relative to that root)
      * @param  list<array<string, mixed>>  $rules
      * @param  array{max_entries: int, max_candidates: int, max_depth: int}  $limits
+     * @param  array<string, mixed>|null  $archive  the backup.archive section; null when absent
      */
     private function __construct(
         public readonly string $file,
@@ -55,6 +56,7 @@ final class JanitorPolicy
         public readonly array $projects,
         public readonly array $rules,
         public readonly array $limits,
+        public readonly ?array $archive = null,
     ) {
     }
 
@@ -109,7 +111,9 @@ final class JanitorPolicy
             throw self::invalid('at least one rule is required');
         }
 
-        return new self($path, hash('sha256', $bytes), $reportsDir, $protect, $projects, array_values($rules), $limits);
+        $archive = isset($config['archive']) ? self::archive($config['archive'], $context) : null;
+
+        return new self($path, hash('sha256', $bytes), $reportsDir, $protect, $projects, array_values($rules), $limits, $archive);
     }
 
     /** @return list<string> */
@@ -250,6 +254,59 @@ final class JanitorPolicy
             'exclude' => $rule['exclude'] ?? [],
             'min_age_days' => (float) $age,
             'retention' => $retention,
+        ];
+    }
+
+    /**
+     * The backup.archive section. Sources are validated exactly like
+     * `entries` rules (roots, names, age, retention); the encryption key and
+     * remote storage live in the host-local settings file, never here.
+     */
+    private static function archive(mixed $config, AgentContext $context): array
+    {
+        if (! is_array($config)) {
+            throw self::invalid('archive must be an object');
+        }
+        $sources = [];
+        foreach ((array) ($config['sources'] ?? []) as $index => $source) {
+            $source = is_array($source) ? $source : [];
+            if (isset($source['kind'])) {
+                throw self::invalid("archive.sources[{$index}] takes no kind: sources are always top-level directories");
+            }
+            $normalized = self::rule(['kind' => self::KIND_ENTRIES] + $source, "archive.sources[{$index}]", $context);
+            if (isset($sources[$normalized['id']])) {
+                throw self::invalid("archive source id '{$normalized['id']}' is declared twice");
+            }
+            $sources[$normalized['id']] = $normalized;
+        }
+        if ($sources === []) {
+            throw self::invalid('archive.sources needs at least one source');
+        }
+        foreach (['settings', 'staging'] as $key) {
+            if (! is_string($config[$key] ?? null) || $config[$key] === '') {
+                throw self::invalid("archive.{$key} must be a path");
+            }
+        }
+        $compression = $config['compression'] ?? 'gzip';
+        if (! in_array($compression, ['gzip', 'zstd'], true)) {
+            throw self::invalid('archive.compression must be gzip or zstd');
+        }
+        $level = $config['compression_level'] ?? ($compression === 'gzip' ? 6 : 10);
+        if (! is_int($level) || $level < 1 || $level > ($compression === 'gzip' ? 9 : 19)) {
+            throw self::invalid('archive.compression_level is out of range for '.$compression);
+        }
+        $max = $config['max_archive_bytes'] ?? 5 * 1024 ** 3;
+        if (! is_int($max) || $max < 1) {
+            throw self::invalid('archive.max_archive_bytes must be a positive integer');
+        }
+
+        return [
+            'sources' => array_values($sources),
+            'settings' => Paths::join($context->workspaceRoot, $config['settings']),
+            'staging' => Paths::join($context->workspaceRoot, $config['staging']),
+            'compression' => $compression,
+            'compression_level' => $level,
+            'max_archive_bytes' => $max,
         ];
     }
 
