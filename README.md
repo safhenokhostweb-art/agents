@@ -440,6 +440,8 @@ browser GETs to the target origin.
 | `pages`, `widths` | same-origin paths and viewport widths; defaults from `sentinel_ui.pages` / `sentinel_ui.widths` |
 | `visual` | add the screenshot comparison against `tests/sentinel/__baselines__/<host>/` |
 | `storage_state`, `editor_paths` | a signed-in Playwright storage state and editor paths for the read-only Canvas editor audit |
+| `max_tasks` | findings per scan, 3–5 (default `sentinel_ui.max_tasks`, 5) |
+| `force` | ignore the state fingerprint and the cooldown once (a deliberate manual review) |
 | `release_id`, `commit_sha`, `deployment_id`, … | forwarded from the integrity event and recorded in the target |
 
 **What the suite checks** (page × width), each a finding with a task text:
@@ -455,11 +457,44 @@ browser GETs to the target origin.
   `prefers-reduced-motion`;
 - optionally, the editor page-tab strip, and visual diffs.
 
+**Guardrails** (owner, 2026-11-02), so the agent can never loop on its
+own output:
+
+- **Read-only advisor.** It reports tasks as Markdown and JSON. It never
+  changes code, content or screenshot baselines.
+- **Capped output.** At most `max_tasks` (3–5, default 5) findings per
+  scan, most urgent first: P1 = blocker, P2 = warning, P3 = UX friction.
+  The rest stay in the sealed report (`backlog_task_keys`) behind one
+  `SENTINEL_UI_BACKLOG` note.
+- **State fingerprint.** The fingerprint is a sha256 over the target,
+  pages, widths, visual/editor options, the deployed `commit_sha` (from
+  the integrity event), the suite commit and the hash of
+  `widget-profiles.json` (the schema state). Every task has a stable key.
+  While the fingerprint matches the newest intact `sentinel-ui` artifact
+  for the same target:
+  - tasks already reported are not reported again (one
+    `SENTINEL_UI_ALREADY_REPORTED` note). A genuinely new task still
+    surfaces;
+  - a rerun inside `cooldown_seconds` (default 600) does not start the
+    browser at all: `data.status` is `UNCHANGED`, and no artifact or event
+    is produced.
+
+  A new deployment, suite or schema is a new state, and everything is
+  reported again. The agent's own events have no subscribers, and the
+  kernel never feeds an agent its own messages.
+- **Widget friction metric.** `widget-profiles.json` → `friction` lists,
+  from the registry schema, the widgets missing an essential author
+  control: carousels without drag/swipe physics, navigation dots, arrows or
+  autoplay. Controls the Style tab gives every block (per-breakpoint
+  padding, corner radius) count as provided. A friction widget on an
+  audited page becomes a `UX_FRICTION` task (P3). The full inventory is in
+  the report (`friction_inventory`).
+
 **Result.** The verdict is recomputed from the report's findings (any
 blocker → `BLOCKED`, any warning → `ATTENTION`, else `READY`), and
-`data.status` is `PASSED` without blockers, `FAILED` otherwise. Each suite
-task becomes one finding (code, severity, widget, the pages and widths, and
-the change as `remedy`); at most 100, the rest stay in the report.
+`data.status` is `PASSED` without blockers, `FAILED` otherwise. Each
+reported task becomes one finding (code, severity, widget, priority, task key,
+the pages and widths, and the change as `remedy`).
 Preconditions are `BLOCKED`: `NOT_CONFIGURED`, `PROJECT_REQUIRED`,
 `TARGET_UNKNOWN`, `TARGET_INVALID`, `STORAGE_STATE_MISSING`,
 `RUNNER_MISSING`, `RUNNER_NO_REPORT` (with the runner's stderr tail).

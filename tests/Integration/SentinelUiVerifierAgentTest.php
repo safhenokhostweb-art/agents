@@ -47,6 +47,12 @@ final class SentinelUiVerifierAgentTest extends TestCase
         $this->root = str_replace('\\', '/', sys_get_temp_dir()).'/agents-ui-'.bin2hex(random_bytes(4));
         mkdir($this->root.'/suite', 0777, true);
         copy(dirname(__DIR__).'/Support/SentinelUiFixture/fake-runner.php', $this->root.'/suite/fake-runner.php');
+        $this->workspace();
+        $this->bus = new InMemoryBus();
+    }
+
+    private function workspace(array $guardrails = []): void
+    {
         file_put_contents($this->root.'/workspace.json', Json::encode([
             'schema' => AgentContext::SCHEMA,
             'projects' => ['suite' => ['path' => 'suite'], 'shop' => ['path' => 'suite']],
@@ -57,9 +63,8 @@ final class SentinelUiVerifierAgentTest extends TestCase
                 'targets' => ['shop' => ['local' => 'http://shop.test', 'production' => 'https://shop.example.com']],
                 'pages' => ['shop' => ['/', '/about']],
                 'widths' => [390, 1280],
-            ],
+            ] + $guardrails,
         ]));
-        $this->bus = new InMemoryBus();
     }
 
     public function tearDown(): void
@@ -164,6 +169,62 @@ final class SentinelUiVerifierAgentTest extends TestCase
         $this->assertThrows(ProtocolException::class, static fn () => UiReport::fromArray(['schema' => 'other', 'findings' => [], 'tasks' => []]));
         $this->assertThrows(ProtocolException::class, static fn () => UiReport::fromArray(['schema' => UiReport::SCHEMA, 'findings' => [['code' => 'X', 'severity' => 'fatal']], 'tasks' => []]));
         $this->assertSame('ATTENTION', UiReport::fromArray(['schema' => UiReport::SCHEMA, 'findings' => [['code' => 'X', 'severity' => 'warning']], 'tasks' => []])->verdict());
+    }
+
+    public function testOutputIsCappedMostUrgentFirstWithTheRestAsBacklog(): void
+    {
+        $task = static fn (string $code, string $severity, string $priority): array => ['id' => $code, 'key' => substr(hash('sha256', $code), 0, 16), 'priority' => $priority, 'severity' => $severity, 'code' => $code, 'widget' => null, 'title' => $code, 'change' => 'fix '.$code, 'where' => ['/'], 'occurrences' => 1];
+        $this->scenario(['findings' => [['code' => 'A', 'severity' => 'blocker']], 'tasks' => [
+            $task('FRICTION_A', 'warning', 'P3'), $task('WARN_A', 'warning', 'P2'), $task('BLOCK_A', 'blocker', 'P1'),
+            $task('WARN_B', 'warning', 'P2'), $task('FRICTION_B', 'warning', 'P3'), $task('BLOCK_B', 'blocker', 'P1'), $task('WARN_C', 'warning', 'P2'),
+        ]]);
+        $outcome = $this->run(['project' => 'shop', 'max_tasks' => 3]);
+
+        $codes = array_map(static fn ($f) => $f->code, $outcome->result->findings);
+        $this->assertSame(['BLOCK_A', 'BLOCK_B', 'WARN_A', 'SENTINEL_UI_BACKLOG'], $codes, 'P1 first, then P2, never more than max_tasks');
+        $payload = Json::decodeFile($outcome->artifacts[0]['path'])['payload'];
+        $this->assertCount(3, $payload['emitted_task_keys']);
+        $this->assertCount(4, $payload['backlog_task_keys']);
+        $this->assertSame(['read_only' => true, 'max_tasks' => 3, 'cooldown_seconds' => 600, 'forced' => false], $payload['guardrails']);
+        $this->assertSame('INVALID_PAYLOAD', $this->run(['project' => 'shop', 'max_tasks' => 9, 'force' => true])->result->findings[0]->code);
+    }
+
+    public function testUnchangedStateNeverRepeatsATaskAndANewTaskStillSurfaces(): void
+    {
+        $this->workspace(['cooldown_seconds' => 0]);
+        $this->scenario(self::BLOCKING);
+        $first = $this->run(['project' => 'shop']);
+        $this->assertSame(['PAGE_HORIZONTAL_OVERFLOW', 'FEATURE_MISSING_LOGO'], array_map(static fn ($f) => $f->code, $first->result->findings));
+
+        $second = $this->run(['project' => 'shop']);
+        $this->assertSame(['SENTINEL_UI_ALREADY_REPORTED'], array_map(static fn ($f) => $f->code, $second->result->findings), 'same state: nothing is regenerated');
+        $this->assertSame('BLOCKED', $second->result->data['verdict'], 'the verdict still reflects the site');
+
+        $scenario = self::BLOCKING;
+        $scenario['tasks'][] = ['id' => 'T-003', 'severity' => 'warning', 'priority' => 'P2', 'code' => 'BROKEN_IMAGE', 'widget' => 'hero', 'title' => 'Image does not load.', 'change' => 'Re-upload it.', 'where' => ['/ @ 390px'], 'occurrences' => 1];
+        $this->scenario($scenario);
+        $third = $this->run(['project' => 'shop']);
+        $this->assertSame(['BROKEN_IMAGE', 'SENTINEL_UI_ALREADY_REPORTED'], array_map(static fn ($f) => $f->code, $third->result->findings));
+
+        $deployed = $this->run(['project' => 'shop', 'commit_sha' => str_repeat('c', 40)]);
+        $this->assertSame(['PAGE_HORIZONTAL_OVERFLOW', 'FEATURE_MISSING_LOGO', 'BROKEN_IMAGE'], array_map(static fn ($f) => $f->code, $deployed->result->findings), 'a new deployed commit is a new state: report again (P1, then P2 in report order)');
+    }
+
+    public function testCooldownSkipsTheBrowserUntilForced(): void
+    {
+        $this->scenario(self::BLOCKING);
+        $this->run(['project' => 'shop']);
+        @unlink($this->root.'/suite/env-seen.json');
+
+        $again = $this->run(['project' => 'shop']);
+        $this->assertSame('UNCHANGED', $again->result->data['status']);
+        $this->assertSame(['SENTINEL_UI_UNCHANGED'], array_map(static fn ($f) => $f->code, $again->result->findings));
+        $this->assertSame([], $again->artifacts);
+        $this->assertFalse(is_file($this->root.'/suite/env-seen.json'), 'the suite did not run');
+
+        $forced = $this->run(['project' => 'shop', 'force' => true]);
+        $this->assertTrue(is_file($this->root.'/suite/env-seen.json'));
+        $this->assertSame(['PAGE_HORIZONTAL_OVERFLOW', 'FEATURE_MISSING_LOGO'], array_map(static fn ($f) => $f->code, $forced->result->findings), 'force reports everything again');
     }
 
     public function testShippedRegistryEntryMatchesTheAgent(): void

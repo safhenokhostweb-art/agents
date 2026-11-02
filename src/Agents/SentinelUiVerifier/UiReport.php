@@ -69,6 +69,38 @@ final class UiReport
         return array_values(array_filter($this->document['tasks'], 'is_array'));
     }
 
+    /** P1 (blocker) → P2 (warning) → P3 (UX friction); the suite's own priority when valid. */
+    public static function priority(array $task): string
+    {
+        $priority = $task['priority'] ?? null;
+        if (in_array($priority, ['P1', 'P2', 'P3'], true)) {
+            return $priority;
+        }
+
+        return ($task['severity'] ?? null) === 'blocker' ? 'P1' : 'P2';
+    }
+
+    /** A task's identity across runs: the suite's key, else a hash of what it asks. */
+    public static function taskKey(array $task): string
+    {
+        $key = $task['key'] ?? null;
+        if (is_string($key) && preg_match('/^[0-9a-f]{8,64}$/', $key) === 1) {
+            return $key;
+        }
+
+        return substr(hash('sha256', implode('|', [(string) ($task['code'] ?? ''), (string) ($task['widget'] ?? ''), (string) ($task['change'] ?? '')])), 0, 16);
+    }
+
+    /** @return list<array<string, mixed>> the tasks, most urgent first (stable within a priority) */
+    public function prioritizedTasks(): array
+    {
+        $tasks = $this->tasks();
+        $order = array_keys($tasks);
+        usort($order, static fn (int $a, int $b): int => strcmp(self::priority($tasks[$a]), self::priority($tasks[$b])) ?: $a <=> $b);
+
+        return array_map(static fn (int $i): array => $tasks[$i], $order);
+    }
+
     /**
      * One finding per suite task (blocker/warning), plus one info finding
      * when the run needs no change.
@@ -77,8 +109,20 @@ final class UiReport
      */
     public function findings(string $baseUrl): array
     {
+        return self::findingsFor($this->tasks(), $baseUrl, true);
+    }
+
+    /**
+     * Findings for the given tasks only (the agent passes the capped,
+     * not-yet-reported ones).
+     *
+     * @param  list<array<string, mixed>>  $tasks
+     * @return list<Finding>
+     */
+    public static function findingsFor(array $tasks, string $baseUrl, bool $noteWhenEmpty = false): array
+    {
         $out = [];
-        foreach (array_slice($this->tasks(), 0, self::FINDING_LIMIT) as $task) {
+        foreach (array_slice($tasks, 0, self::FINDING_LIMIT) as $task) {
             $severity = Severity::tryFrom((string) ($task['severity'] ?? '')) ?? Severity::Warning;
             $where = is_array($task['where'] ?? null) ? array_values($task['where']) : [];
             $code = preg_match('/^[A-Z][A-Z0-9_]*$/', (string) ($task['code'] ?? '')) === 1 ? (string) $task['code'] : 'UI_DEFECT';
@@ -87,14 +131,14 @@ final class UiReport
                 $severity,
                 sprintf('%s (%d×: %s)', (string) ($task['title'] ?? $code), (int) ($task['occurrences'] ?? count($where)), implode('; ', array_slice($where, 0, 5))),
                 is_string($task['widget'] ?? null) && $task['widget'] !== '' ? $task['widget'] : $baseUrl,
-                ['task_id' => $task['id'] ?? null, 'where' => $where, 'occurrences' => $task['occurrences'] ?? null],
+                ['task_id' => $task['id'] ?? null, 'task_key' => self::taskKey($task), 'priority' => self::priority($task), 'where' => $where, 'occurrences' => $task['occurrences'] ?? null],
                 is_string($task['change'] ?? null) && $task['change'] !== '' ? $task['change'] : null,
             );
         }
-        if (count($this->tasks()) > self::FINDING_LIMIT) {
-            $out[] = Finding::info('SENTINEL_UI_TRUNCATED', sprintf('%d more task(s) are only in report.json.', count($this->tasks()) - self::FINDING_LIMIT), $baseUrl);
+        if (count($tasks) > self::FINDING_LIMIT) {
+            $out[] = Finding::info('SENTINEL_UI_TRUNCATED', sprintf('%d more task(s) are only in report.json.', count($tasks) - self::FINDING_LIMIT), $baseUrl);
         }
-        if ($out === []) {
+        if ($out === [] && $noteWhenEmpty) {
             $out[] = Finding::info('SENTINEL_UI_READY', 'No UI change required on '.$baseUrl.'.', $baseUrl);
         }
 

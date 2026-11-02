@@ -6,6 +6,7 @@ namespace Workspace\Agents\Agents\SentinelUiVerifier;
 
 use Workspace\Agents\Kernel\AbstractAgent;
 use Workspace\Agents\Kernel\AgentContext;
+use Workspace\Agents\Kernel\ArtifactStore;
 use Workspace\Agents\Kernel\Artifact;
 use Workspace\Agents\Kernel\Finding;
 use Workspace\Agents\Kernel\ProtocolException;
@@ -28,6 +29,18 @@ use Workspace\Agents\Support\Process;
  * it as a `sentinel-ui` artifact. It only reads pages (HTTP GET in a
  * browser); it never writes to the projects. Its output directory is under
  * agents/var.
+ *
+ * Guardrails (owner, 2026-11-02), so it can never spin on its own output:
+ *  - read-only advisor: it reports tasks (Markdown + JSON) and changes no
+ *    code, content or baseline;
+ *  - capped output: at most `max_tasks` (3–5, default 5) findings per scan,
+ *    most urgent first (P1 blocker, P2 warning, P3 UX friction); the rest
+ *    stay in the sealed report as backlog;
+ *  - state fingerprint: target, pages, widths, the deployed commit, the
+ *    suite commit and the widget-profile (schema) hash. While it is
+ *    unchanged, tasks already reported are not reported again, and a rerun
+ *    inside `cooldown_seconds` does not even start the browser. `force`
+ *    lifts both for a deliberate manual review.
  */
 final class SentinelUiVerifierAgent extends AbstractAgent
 {
@@ -40,6 +53,10 @@ final class SentinelUiVerifierAgent extends AbstractAgent
     public const ARTIFACT_KIND = 'sentinel-ui';
     public const ARTIFACT_NAME = 'ui-audit';
     public const REPORT_SCHEMA = 'sentinel.ui-audit/v1';
+    public const MAX_TASKS_DEFAULT = 5;
+    public const MAX_TASKS_RANGE = [3, 5];
+    public const COOLDOWN_DEFAULT = 600;
+    private const PREVIOUS_SCAN_LIMIT = 50;
 
     public function id(): string
     {
@@ -67,6 +84,8 @@ final class SentinelUiVerifierAgent extends AbstractAgent
             'visual' => '?bool',
             'storage_state' => '?string',
             'editor_paths' => '?list',
+            'max_tasks' => '?int',
+            'force' => '?bool',
             // Forwarded by the sentinel.verification.passed subscription.
             'project_key' => '?string',
             'release_id' => '?string',
@@ -143,6 +162,38 @@ final class SentinelUiVerifierAgent extends AbstractAgent
             throw new ProtocolException('RUNNER_MISSING', "The suite project {$runner['project']} is not checked out at {$suiteRoot}.");
         }
 
+        $maxTasks = $p['max_tasks'] ?? ($config['max_tasks'] ?? self::MAX_TASKS_DEFAULT);
+        if (! is_int($maxTasks) || $maxTasks < self::MAX_TASKS_RANGE[0] || $maxTasks > self::MAX_TASKS_RANGE[1]) {
+            throw new ProtocolException('INVALID_PAYLOAD', 'max_tasks must be between '.self::MAX_TASKS_RANGE[0].' and '.self::MAX_TASKS_RANGE[1].'.');
+        }
+        $cooldown = $config['cooldown_seconds'] ?? self::COOLDOWN_DEFAULT;
+        $cooldown = is_int($cooldown) && $cooldown >= 0 ? $cooldown : self::COOLDOWN_DEFAULT;
+        $force = ($p['force'] ?? false) === true;
+
+        $suiteHead = (new Git($suiteRoot))->head();
+        $profilesFile = $suiteRoot.'/tests/sentinel/widget-profiles.json';
+        $targetKey = implode('|', [$project, (string) $environment, $baseUrl]);
+        $state = [
+            'target' => $targetKey,
+            'pages' => $pages,
+            'widths' => $widths,
+            'visual' => ($p['visual'] ?? false) === true,
+            'editor_paths' => $editorPaths,
+            'deployed_commit' => is_string($p['commit_sha'] ?? null) ? $p['commit_sha'] : null,
+            'suite_commit' => $suiteHead,
+            'profiles_sha256' => is_file($profilesFile) ? hash_file('sha256', $profilesFile) : null,
+        ];
+        $fingerprint = hash('sha256', Json::canonical($state));
+        $previous = $force ? null : $this->previousAudit($context, $targetKey);
+        $sameState = $previous !== null && $previous['fingerprint'] === $fingerprint;
+        if ($sameState && $cooldown > 0 && $previous['age'] < $cooldown) {
+            return Result::pass(
+                sprintf('UI audit of %s skipped: nothing changed since %s (%ds ago, cooldown %ds).', $baseUrl, $previous['artifact_id'], $previous['age'], $cooldown),
+                [Finding::info('SENTINEL_UI_UNCHANGED', 'Same commit, schema and target as the last audit inside the cooldown window: not re-evaluated (pass force to override).', $baseUrl, ['previous' => $previous['artifact_id'], 'state_fingerprint' => $fingerprint])],
+                data: ['status' => 'UNCHANGED', 'verdict' => $previous['verdict'], 'previous' => $previous['artifact_id'], 'state_fingerprint' => $fingerprint],
+            );
+        }
+
         $runId = Id::new('ui');
         $outputDir = $context->path((string) ($config['output'] ?? 'agents/var/sentinel-ui')).'/'.$runId;
         if (! is_dir($outputDir) && ! @mkdir($outputDir, 0777, true) && ! is_dir($outputDir)) {
@@ -181,14 +232,32 @@ final class SentinelUiVerifierAgent extends AbstractAgent
             'deployment_id' => $p['deployment_id'] ?? null,
         ], static fn (mixed $v): bool => is_string($v) && $v !== '');
         $files = ['json' => $reportFile, 'markdown' => $outputDir.'/report.md'];
-        $suiteHead = (new Git($suiteRoot))->head();
 
-        $summary = sprintf('UI audit of %s: %s (%d blocker, %d warning, %d info; %d task(s)).', $baseUrl, $verdict, $counts['blocker'], $counts['warning'], $counts['info'], count($report->tasks()));
-        $eventPayload = $target + ['status' => $status, 'verdict' => $verdict, 'counts' => $counts, 'tasks' => count($report->tasks()), 'report' => $files];
+        // Dedup by state, then cap: only new tasks are reported, most urgent first.
+        $known = $sameState ? $previous['known_task_keys'] : [];
+        $tasks = $report->prioritizedTasks();
+        $new = array_values(array_filter($tasks, static fn (array $t): bool => ! in_array(UiReport::taskKey($t), $known, true)));
+        $suppressed = array_values(array_filter($tasks, static fn (array $t): bool => in_array(UiReport::taskKey($t), $known, true)));
+        $emitted = array_slice($new, 0, $maxTasks);
+        $backlog = array_slice($new, $maxTasks);
+        $keys = static fn (array $list): array => array_values(array_map([UiReport::class, 'taskKey'], $list));
+        $findings = UiReport::findingsFor($emitted, $baseUrl);
+        if ($suppressed !== []) {
+            $findings[] = Finding::info('SENTINEL_UI_ALREADY_REPORTED', sprintf('%d task(s) were already reported for this state (%s) and are not repeated.', count($suppressed), $previous['artifact_id']), $baseUrl, ['task_keys' => $keys($suppressed)]);
+        }
+        if ($backlog !== []) {
+            $findings[] = Finding::info('SENTINEL_UI_BACKLOG', sprintf('%d more task(s) wait in the report (at most %d per scan, most urgent first).', count($backlog), $maxTasks), $baseUrl, ['task_keys' => $keys($backlog)]);
+        }
+        if ($tasks === []) {
+            $findings[] = Finding::info('SENTINEL_UI_READY', 'No UI change required on '.$baseUrl.'.', $baseUrl);
+        }
+
+        $summary = sprintf('UI audit of %s: %s (%d blocker, %d warning, %d info; %d task(s): %d new reported, %d backlog, %d already reported).', $baseUrl, $verdict, $counts['blocker'], $counts['warning'], $counts['info'], count($tasks), count($emitted), count($backlog), count($suppressed));
+        $eventPayload = $target + ['status' => $status, 'verdict' => $verdict, 'counts' => $counts, 'tasks' => count($tasks), 'new_tasks' => count($emitted), 'report' => $files, 'state_fingerprint' => $fingerprint];
 
         return Result::pass(
             $summary,
-            findings: $report->findings($baseUrl),
+            findings: $findings,
             artifacts: [new Artifact(
                 self::ARTIFACT_KIND,
                 [
@@ -201,7 +270,15 @@ final class SentinelUiVerifierAgent extends AbstractAgent
                     'tests' => $report->document['tests'] ?? null,
                     'pages' => $pages,
                     'widths' => $widths,
-                    'tasks' => array_slice($report->tasks(), 0, UiReport::FINDING_LIMIT),
+                    'tasks' => array_slice($tasks, 0, UiReport::FINDING_LIMIT),
+                    'target_key' => $targetKey,
+                    'state' => $state,
+                    'state_fingerprint' => $fingerprint,
+                    'guardrails' => ['read_only' => true, 'max_tasks' => $maxTasks, 'cooldown_seconds' => $cooldown, 'forced' => $force],
+                    'emitted_task_keys' => $keys($emitted),
+                    'backlog_task_keys' => $keys($backlog),
+                    'suppressed_task_keys' => $keys($suppressed),
+                    'known_task_keys' => array_values(array_unique([...$known, ...$keys($tasks)])),
                     'runner_exit_code' => $exit,
                     'report' => $files,
                 ],
@@ -212,5 +289,47 @@ final class SentinelUiVerifierAgent extends AbstractAgent
             events: [['topic' => $status === 'PASSED' ? self::EVENT_PASSED : self::EVENT_FAILED, 'payload' => $eventPayload]],
             data: $eventPayload + ['run_id' => $runId],
         );
+    }
+
+    /**
+     * The newest intact `sentinel-ui` artifact this agent sealed for the same
+     * target (envelope and attachment digests verify). Tampered or foreign
+     * artifacts are skipped, never trusted.
+     *
+     * @return array{artifact_id: string, fingerprint: ?string, known_task_keys: list<string>, verdict: string, age: int}|null
+     */
+    private function previousAudit(AgentContext $context, string $targetKey): ?array
+    {
+        $settings = (array) $context->setting('runtime', []);
+        $root = $context->path((string) ($settings['artifacts'] ?? 'agents/var/artifacts')).'/'.self::ARTIFACT_KIND;
+        $candidates = [];
+        foreach (is_dir($root) ? (scandir($root) ?: []) : [] as $entry) {
+            if (preg_match('/-(\d{8}T\d{6})-[0-9a-f]{8}$/D', $entry, $match) === 1 && is_file("{$root}/{$entry}/artifact.json")) {
+                $candidates[] = [$match[1], $entry];
+            }
+        }
+        rsort($candidates);
+        foreach (array_slice($candidates, 0, self::PREVIOUS_SCAN_LIMIT) as [$stamp, $entry]) {
+            $path = "{$root}/{$entry}/artifact.json";
+            if (! ArtifactStore::verify($path)['valid']) {
+                continue;
+            }
+            $envelope = Json::decodeFile($path);
+            $payload = (array) ($envelope['payload'] ?? []);
+            if (($envelope['producer']['agent'] ?? null) !== self::ID || ($payload['target_key'] ?? null) !== $targetKey) {
+                continue;
+            }
+            $sealed = \DateTimeImmutable::createFromFormat('Ymd\THis', $stamp, new \DateTimeZone('UTC'));
+
+            return [
+                'artifact_id' => (string) ($envelope['artifact_id'] ?? $entry),
+                'fingerprint' => is_string($payload['state_fingerprint'] ?? null) ? $payload['state_fingerprint'] : null,
+                'known_task_keys' => array_values(array_filter((array) ($payload['known_task_keys'] ?? []), 'is_string')),
+                'verdict' => is_string($payload['verdict'] ?? null) ? $payload['verdict'] : 'ATTENTION',
+                'age' => $sealed === false ? PHP_INT_MAX : max(0, time() - $sealed->getTimestamp()),
+            ];
+        }
+
+        return null;
     }
 }
