@@ -13,6 +13,19 @@
     "disk_janitor": {
         "policy": "agents/disk-janitor.json"
     },
+    "sentinel_ui": {
+        "runner": {
+            "project": "saas-platform",
+            "command": ["node", "node_modules/@playwright/test/cli.js", "test", "-c", "tests/sentinel/playwright.sentinel.config.ts"]
+        },
+        "output": "agents/var/sentinel-ui",
+        "targets": {
+            "saas-platform": { "local": "http://127.0.0.1:8000", "production": "https://panel.safhenokhost.ir" },
+            "customer-site": { "local": "http://customer-site.test", "production": "https://safhenokhost.ir" }
+        },
+        "pages": { "saas-platform": ["/"], "customer-site": ["/"] },
+        "widths": [360, 390, 768, 1024, 1280, 1440]
+    },
     "runtime": {
         "artifacts": "agents/var/artifacts",
         "journal": "agents/var/bus/journal.jsonl"

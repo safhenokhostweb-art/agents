@@ -37,6 +37,30 @@
             }
         },
         {
+            "id": "sentinel-ui-verifier",
+            "class": "Workspace\\Agents\\Agents\\SentinelUiVerifier\\SentinelUiVerifierAgent",
+            "enabled": true,
+            "subscriptions": [
+                {
+                    "topic": "sentinel.verification.passed",
+                    "task": "sentinel.ui-audit"
+                },
+                {
+                    "topic": "sentinel.ui-audit-requested",
+                    "task": "sentinel.ui-audit"
+                }
+            ],
+            "produces": {
+                "artifacts": [
+                    "sentinel-ui"
+                ],
+                "events": [
+                    "sentinel.ui-audit.passed",
+                    "sentinel.ui-audit.failed"
+                ]
+            }
+        },
+        {
             "id": "server-disk-janitor",
             "class": "Workspace\\Agents\\Agents\\ServerDiskJanitor\\ServerDiskJanitorAgent",
             "enabled": true,
@@ -89,6 +113,10 @@
                 "x": 719,
                 "y": 37
             },
+            "sentinel-ui-verifier": {
+                "x": 1060,
+                "y": 37
+            },
             "server-disk-janitor": {
                 "x": 719,
                 "y": 330
@@ -109,6 +137,11 @@
                 "source": "release-preparer",
                 "target": "server-disk-janitor",
                 "label": "deployment.completed"
+            },
+            {
+                "source": "sentinel-verifier",
+                "target": "sentinel-ui-verifier",
+                "label": "sentinel.verification.passed"
             }
         ],
         "tasks": {

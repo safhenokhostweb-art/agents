@@ -19,7 +19,7 @@ agents/
   bin/agent          CLI
   src/Kernel/        the protocol (contracts, bus, orchestrator, artifact store)
   src/Support/       read-only helpers (git, composer, globbing, hashing, semver)
-  src/Agents/<Name>/ one directory per agent (DependencyDeployment, SentinelVerifier, ServerDiskJanitor)
+  src/Agents/<Name>/ one directory per agent (DependencyDeployment, SentinelVerifier, SentinelUiVerifier, ServerDiskJanitor)
   tests/             zero-dependency runner, unit + integration suites
   var/               runtime output (gitignored): artifacts/, bus/journal.jsonl
 ```
@@ -199,6 +199,10 @@ over the canonical (key-sorted, compact) JSON of the envelope without its
 | `deployment.completed` | topic (subscribed) | → `sentinel.verify` | same as the task payload |
 | `sentinel.audit-requested` | topic (subscribed) | → `sentinel.verify` | same as the task payload |
 | `sentinel.verification.passed` / `.failed` | topics | sentinel-verifier | `project_key`, `environment`, `release_id`, `commit_sha`, `deployment_id`, `status`, `sentinel_verdict`, `verdict`, `evidence_hash`, `snapshot_hash`, `non_conformant_files`, `reasons`, `reaudit_of` |
+| `sentinel.ui-audit` | task | sentinel-ui-verifier | see [Sentinel UI Verifier](#sentinel-ui-verifier-sentinel-ui-verifier) |
+| `sentinel.verification.passed` | topic (subscribed) | → `sentinel.ui-audit` | the integrity event; `project_key` + `environment` pick the target |
+| `sentinel.ui-audit-requested` | topic (subscribed) | → `sentinel.ui-audit` | same as the task payload |
+| `sentinel.ui-audit.passed` / `.failed` | topics | sentinel-ui-verifier | `project`, `environment`, `base_url`, `release_id?`, `commit_sha?`, `deployment_id?`, `status`, `verdict`, `counts`, `tasks`, `report: {json, markdown}` |
 | `disk.clean` | task | server-disk-janitor | `dry_run?: bool` (default `true`), `policy?: string`, `rules?: list` |
 | `maintenance.disk-clean-requested` | topic (subscribed) | → `disk.clean` | same as the task payload |
 | `deployment.completed` | topic (subscribed) | → `disk.clean` | foreign keys ignored, so always a dry-run audit |
@@ -405,6 +409,79 @@ signature are checked at ingest and are not available offline, so a
 snapshot file is trusted only as far as its contents and its binding to the
 evidence. The deployment-system repository's Server Agent declares
 `AGENT_VERSION = '1.4.2'`; pass `min_agent_version` to require a newer one.
+
+## Sentinel UI Verifier (`sentinel-ui-verifier`)
+
+Audits the live UI of a deployed site in a real browser and reports what
+must change, as tasks. Owner-approved on 2026-11-02 (saas-platform ADR-077).
+
+**Chain.** It subscribes to `sentinel.verification.passed`: once the
+integrity audit has proved the deployment is the released one, the UI audit
+runs against that project and environment. `sentinel.ui-audit-requested`
+and `bin/agent run sentinel.ui-audit` start it by hand. A re-audit event
+(`reaudit_of` set) is skipped, because nothing new was deployed.
+
+**Boundary.** It runs saas-platform's `tests/sentinel` Playwright suite
+(`workspace.json` → `sentinel_ui.runner`) with the target in the
+environment. The suite only loads pages; it never clicks to change state,
+types or saves. It never writes screenshot baselines
+(`SENTINEL_UPDATE_BASELINES=0`). It writes only into its output
+directory (`sentinel_ui.output`, default `agents/var/sentinel-ui/<run>`).
+Unlike `sentinel-verifier`, it does make network requests, but only
+browser GETs to the target origin.
+
+**Inputs** (`sentinel.ui-audit` payload):
+
+| Key | Meaning |
+|---|---|
+| `project` (or `project_key`) | the project whose site to audit; required |
+| `environment` | key into `sentinel_ui.targets.<project>`; default `local` |
+| `base_url` | an explicit bare http(s) origin; overrides the target |
+| `pages`, `widths` | same-origin paths and viewport widths; defaults from `sentinel_ui.pages` / `sentinel_ui.widths` |
+| `visual` | add the screenshot comparison against `tests/sentinel/__baselines__/<host>/` |
+| `storage_state`, `editor_paths` | a signed-in Playwright storage state and editor paths for the read-only Canvas editor audit |
+| `release_id`, `commit_sha`, `deployment_id`, … | forwarded from the integrity event and recorded in the target |
+
+**What the suite checks** (page × width), each a finding with a task text:
+
+- page horizontal overflow and the widgets causing it, plus content
+  sticking out of its widget box;
+- the widget feature profiles (`tests/sentinel/widget-profiles.json`,
+  generated from the registry, e.g. header logo/menu/actions, footer links,
+  CTAs with real destinations) and dead `href="#"` links;
+- broken images, failed same-origin requests, console and script errors,
+  clipped text, touch targets under 24 px on phones;
+- `dir="rtl"`, Vazirmatn loaded, and infinite animations under
+  `prefers-reduced-motion`;
+- optionally, the editor page-tab strip, and visual diffs.
+
+**Result.** The verdict is recomputed from the report's findings (any
+blocker → `BLOCKED`, any warning → `ATTENTION`, else `READY`), and
+`data.status` is `PASSED` without blockers, `FAILED` otherwise. Each suite
+task becomes one finding (code, severity, widget, the pages and widths, and
+the change as `remedy`); at most 100, the rest stay in the report.
+Preconditions are `BLOCKED`: `NOT_CONFIGURED`, `PROJECT_REQUIRED`,
+`TARGET_UNKNOWN`, `TARGET_INVALID`, `STORAGE_STATE_MISSING`,
+`RUNNER_MISSING`, `RUNNER_NO_REPORT` (with the runner's stderr tail).
+
+**Artifact** `var/artifacts/sentinel-ui/ui-audit-<timestamp>-<random>/artifact.json`,
+payload `sentinel.ui-audit/v1`: `status`, `verdict`, `target`, `counts`,
+`tests`, `pages`, `widths`, `tasks`, `runner_exit_code`, `report` paths.
+Provenance records the suite project's commit and command. The full
+`sentinel.ui-report/v1` is sealed beside it as `report.json`. The Markdown
+defect report is in the output directory.
+
+**Local test.**
+
+```powershell
+php agents/bin/agent run sentinel.ui-audit --payload='{"project":"customer-site","environment":"local"}' --verbose
+php agents/bin/agent run sentinel.ui-audit --payload='{"project":"customer-site","environment":"production","widths":[390,1280]}'
+php agents/bin/agent publish sentinel.ui-audit-requested --payload='{"project":"saas-platform"}'
+php agents/tests/run.php SentinelUi
+```
+
+`PLAYWRIGHT_CHROME_PATH` is passed through to the suite when Playwright's own
+browser is not installed.
 
 ## Server Disk Janitor (`server-disk-janitor`)
 
