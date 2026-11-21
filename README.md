@@ -9,7 +9,7 @@ software those coding agents run, not a replacement for that governance.
 
 Zero dependencies: PHP 8.4 CLI and git. No `composer install` needed.
 
-```
+```text
 agents/
   agents.json        registry: which agents exist, what they subscribe to
   workspace.json     topology: project paths/roles, deployment-system, runtime dirs
@@ -61,17 +61,16 @@ scoped to that project via `bin/pre-push-gate` and:
 
 Bypassing it with `git push --no-verify` is an owner decision.
 
-On this machine PHP is not on the Git-Bash PATH; use
-`C:/laragon/bin/php/php-8.4.16-nts-Win32-vs17-x64/php.exe`.
+Ensure PHP 8.4+ CLI is available on your shell `PATH` (or invoke it via your
+explicit PHP binary path in Git-Bash/Windows environments).
 
-Git from a web server (the deployment-system canvas): the agent finds git
-via `AGENTS_GIT_BINARY`, then `PATH`, then standard locations (system Git
-before Laragon's bundled 2.37). Every git call carries
-`-c safe.directory=<project root>`, scoped to the root `workspace.json`
-declares, so a `.git` owned by `BUILTIN\Administrators` is not rejected as
-dubious when the global gitconfig is out of reach. That needs Git ≥ 2.38;
-older Git still needs the global `safe.directory` entry. `NOT_A_REPOSITORY`
-quotes git's own reason.
+When invoked from a web server (the `deployment-system` canvas), the agent locates
+`git` via `AGENTS_GIT_BINARY`, then `PATH`, then standard system locations. Every
+git call carries `-c safe.directory=<project root>`, scoped to the root declared
+in `workspace.json`, so repositories owned by service or administrator accounts
+are not rejected as dubious when global gitconfig is unreachable (requires Git ≥ 2.38;
+older versions require a global `safe.directory` entry). `NOT_A_REPOSITORY` quotes
+git's own diagnostic message.
 
 ## Protocol
 
@@ -162,7 +161,7 @@ An agent is never triggered by its own messages, and tasks deeper than
 
 ### Artifact envelope — `agents.artifact/v1`
 
-```
+```text
 var/artifacts/<kind>/<artifact_id>/artifact.json
 var/artifacts/<kind>/<artifact_id>/<attachment>.json
 ```
@@ -728,3 +727,16 @@ Restore: download the object, then run
 `gpg --decrypt <object>.tar.gz.gpg | tar -xz` (or `zstd -d` for `.tar.zst.gpg`)
 on the machine that holds the private key, and compare the object's SHA-256
 with the manifest.
+
+## Ecosystem Repositories
+
+This repository is part of a modular, self-hosted open-source ecosystem:
+
+- **[saas-platform](https://github.com/safhenokhostweb-art/saas-platform)** — Core multi-tenant orchestration engine, RBAC, and central API.
+- **[customer-site](https://github.com/safhenokhostweb-art/customer-site)** — Tenant-facing web application and storefront.
+- **[deployment-system](https://github.com/safhenokhostweb-art/deployment-system)** — Standalone pull-based deployment service and server agent.
+- **[agents](https://github.com/safhenokhostweb-art/agents)** — Deterministic workspace runtime agents for deployment readiness, integrity auditing, UI verification, and disk hygiene *(this repository)*.
+
+## License
+
+Released under the [MIT License](LICENSE).
